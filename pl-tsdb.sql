@@ -28,7 +28,7 @@
   MEMBER FUNCTION CLEARTAGS RETURN METRIC,
   -- Sets the value of this metric
   MEMBER FUNCTION VAL(v IN NUMBER) RETURN METRIC,
-  -- Sets the effective timestamp of this metric
+  -- Sets the effective timestamp of this metric, in milliseconds if you know what's best
   MEMBER FUNCTION TS(ts IN NUMBER) RETURN METRIC,
   -- Starts a new timing at the specified timestamp, defaulting to SYSTIMESTAMP
   MEMBER FUNCTION OPEN(ts IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN METRIC,
@@ -51,6 +51,12 @@
   MEMBER PROCEDURE DELTA(met_ric IN METRIC, ts IN TIMESTAMP DEFAULT SYSTIMESTAMP),  
   -- Sleeps the specified number of seconds and returns this metric
   MEMBER FUNCTION SLEEP(secs IN NUMBER) RETURN METRIC,
+  -- Returns the index of the tag pair with the specified key, or -1 if not found
+  MEMBER FUNCTION INDEXOFKEY(key IN VARCHAR2) RETURN INT,
+  -- Determines if this metric has a tag with the specified key
+  MEMBER FUNCTION HASTAGKEY(key IN VARCHAR2) RETURN BOOLEAN,
+  -- Sorts this metric's tags
+  MEMBER FUNCTION SORT RETURN METRIC,
   
   -- Generates a unique key for this metric made up of the metric name and tag keys concatenated together  
   MEMBER FUNCTION METRICKEY RETURN VARCHAR2,
@@ -74,17 +80,22 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
   MEMBER FUNCTION PUSHTAG(tag IN TAGPAIR) RETURN METRIC AS
     me METRIC := SELF;
   BEGIN
-    me.TAGS.extend();
-    me.TAGS(TAGS.COUNT + 1) := tag;
-    RETURN me;
+    RETURN me.PUSHTAG(tag.K, tag.V);
   END PUSHTAG;
   
   -- Adds a new tagpair to this metric
   MEMBER FUNCTION PUSHTAG(k IN VARCHAR2, v IN VARCHAR2) RETURN METRIC AS
     me METRIC := SELF;
+    key CONSTANT VARCHAR2(100) := TSDB_UTIL.CLEAN(k);
+    cnt INT := -1;
   BEGIN
-    me.TAGS.extend();
-    me.TAGS(TAGS.COUNT + 1) := TAGPAIR(TSDB_UTIL.CLEAN(k),TSDB_UTIL.CLEAN(v));
+    cnt := INDEXOFKEY(key);
+    if(cnt=-1) THEN
+      me.TAGS.extend();
+      me.TAGS(TAGS.COUNT + 1) := TAGPAIR(TSDB_UTIL.CLEAN(k),TSDB_UTIL.CLEAN(v));
+    ELSE
+      me.TAGS(cnt).V := TSDB_UTIL.CLEAN(v);
+    END IF;
     RETURN me;
   END PUSHTAG;
   
@@ -134,6 +145,7 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
     me METRIC := SELF;
   BEGIN
     me.START_TIME := ts;
+    LOGGING.tcplog('METRIC OPEN: st: [' || me.START_TIME || ']' );
     RETURN me;
   END OPEN;
   
@@ -144,6 +156,7 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
   BEGIN
     IF(mvalue IS NULL) THEN
       me.VALUE := TSDB_UTIL.ELAPSEDMS(me.START_TIME, ts);
+      LOGGING.tcplog('METRIC CLOSE: value set: [' || me.VALUE || '], calced elapsed: [' || TSDB_UTIL.ELAPSEDMS(me.START_TIME, ts) || '], ts: [' || ts || '], st: [' || me.START_TIME || ']' );
     ELSE
       me.VALUE := mvalue;
       me.TIMING := TSDB_UTIL.ELAPSEDMS(me.START_TIME, ts);
@@ -186,6 +199,16 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
     DBMS_LOCK.SLEEP(secs);
     RETURN me;
   END SLEEP;
+  
+    -- Sorts this metric's tags
+  MEMBER FUNCTION SORT RETURN METRIC AS
+    me METRIC := SELF;
+    ctags TAGPAIR_ARR;
+  BEGIN
+    SELECT VALUE(T) BULK COLLECT INTO ctags FROM TABLE(me.tags) T ORDER BY VALUE(T);
+    me.tags := ctags;
+    RETURN me;
+  END SORT;
   
   
   -- Parametersized metric renderer
@@ -279,6 +302,31 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
     RETURN key;
   END METRICKEY;
   
+    -- Returns the index of the tag pair with the specified key, or -1 if not found
+  MEMBER FUNCTION INDEXOFKEY(key IN VARCHAR2) RETURN INT IS
+    ckey VARCHAR2(100) := TSDB_UTIL.CLEAN(key);
+    cnt INT := 0;  
+  BEGIN
+    SELECT R INTO cnt FROM (SELECT ROWNUM R, T.K KEY FROM TABLE(TAGS) T) X WHERE X.KEY = ckey;
+    RETURN cnt;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      RETURN -1;
+  END INDEXOFKEY;
+  
+  -- Determines if this metric has a tag with the specified key
+  MEMBER FUNCTION HASTAGKEY(key IN VARCHAR2) RETURN BOOLEAN IS
+    ckey VARCHAR2(100) := TSDB_UTIL.CLEAN(key);
+    cnt INT := 0;
+  BEGIN
+    SELECT COUNT(*) INTO cnt FROM TABLE(TAGS) WHERE K = ckey;
+    IF(cnt=0) THEN
+      RETURN FALSE;    
+    END IF;
+    RETURN TRUE;
+  END HASTAGKEY;
+  
+
+  
   -- Parses the passed name in the form '<metric-name>:<key1>=<value1>,....<keyN>=<valueN>' and creates a metric
   STATIC FUNCTION PARSEMETRIC(name IN VARCHAR2) RETURN METRIC IS
     x PLS_INTEGER := 0;
@@ -297,7 +345,7 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
     IF(length(tname) > 3) THEN
       met := met.PUSHTAG(TAGPAIR(tname));
     END IF;
-    return met;
+    return met.HOSTAPPTAGS();
     EXCEPTION WHEN OTHERS THEN
       DECLARE
       errm VARCHAR2(1000) := SQLERRM();
@@ -306,7 +354,7 @@ CREATE OR REPLACE TYPE BODY "METRIC" AS
       END;    
   END PARSEMETRIC;
   
-  
+
   
   
   -- Creates a new Metric. The name is mandatory, the tags default to an empty array if null
@@ -441,6 +489,158 @@ end;
 
 /
 --------------------------------------------------------
+--  DDL for Package TSDB_UTIL
+--------------------------------------------------------
+
+  CREATE OR REPLACE PACKAGE "TSDB_UTIL" AS 
+
+  -- Generic Ref Cursor
+  TYPE TRACECUR IS REF CURSOR;
+  -- Timestamp instance to extract stuff from but is unchanging
+  BASETS CONSTANT TIMESTAMP WITH TIME ZONE := SYSTIMESTAMP;
+  -- The timzone offset hours
+  TZHOUR CONSTANT PLS_INTEGER := extract(TIMEZONE_HOUR from BASETS);
+  -- The timzone offset hours
+  TZMINUTE CONSTANT PLS_INTEGER := extract(TIMEZONE_MINUTE from BASETS);  
+  -- The epoch timestamp
+  EPOCH CONSTANT TIMESTAMP := to_timestamp_tz('1970-01-01 ' || TZHOUR || ':' || TZMINUTE, 'YYYY-MM-DD TZH:TZM');  
+  -- TZ Offset hours/minutes converted to seconds
+  TZOFFSETSECS CONSTANT PLS_INTEGER := (TZHOUR*60*60) + (TZMINUTE*60);
+  -- TZ Offset hours/minutes converted to ms
+  TZOFFSETMS CONSTANT PLS_INTEGER := TZOFFSETSECS * 1000;
+  -- The default max buffer size for TSDBM instances
+  MAX_BUFFER_SIZE CONSTANT INT := 32767;
+  -- EOL Char
+  EOL VARCHAR2(2) := '
+';
+
+  
+  --===================================================================================================================
+  --  Returns the cleaned user statistic keys
+  --===================================================================================================================
+  FUNCTION USERSTATKEYS RETURN VARCHAR2_ARR;
+  
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in milliseconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in seconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+  
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in milliseconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in seconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+  
+  
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in milliseconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSDATE if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN DATE DEFAULT SYSDATE) RETURN NUMBER;
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in seconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSDATE if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN DATE DEFAULT SYSDATE) RETURN NUMBER;
+  
+  --===================================================================================================================
+  --  Determines how many digits are in the passed number
+  --===================================================================================================================
+  FUNCTION DIGITS(n IN NUMBER DEFAULT 0) RETURN INT;  
+  
+  --===================================================================================================================
+  --  Determines if the passed number is most likely SECONDS or MILLISECONDS and returns the value in MILLISECONDS
+  --===================================================================================================================
+  FUNCTION TOMS(n IN NUMBER DEFAULT 0) RETURN NUMBER;  
+  
+  --===================================================================================================================
+  --  Determines if the passed number is most likely SECONDS or MILLISECONDS and returns the value in SECONDS
+  --===================================================================================================================
+  FUNCTION TOSEC(n IN NUMBER DEFAULT 0) RETURN NUMBER;  
+  
+  --==================================================================================================
+  -- Converts the passed date to a timestamp with as high precision as possible.
+  -- The passed date defaults to 'SYSDATE'
+  -- Additional fractional seconds can be specified to add precision.
+  --==================================================================================================
+  FUNCTION DATETOTIMESTAMP(dt IN DATE DEFAULT SYSDATE, fs IN INTEGER DEFAULT 0) RETURN TIMESTAMP;
+  
+  --===================================================================================================================
+  --  Returns the current time as the number of milliseconds since epoch (like java.lang.System.getCurrentTimeMillis())
+  --===================================================================================================================
+  FUNCTION CURRENTMS RETURN NUMBER;
+  
+  --===================================================================================================================
+  --  Returns the current time as the number of seconds since epoch (unix time)
+  --===================================================================================================================
+  FUNCTION CURRENTSEC RETURN NUMBER;
+  
+  --===================================================================================================================
+  --  Returns the sid for the current session
+  --===================================================================================================================
+  FUNCTION SESSION_SID RETURN NUMBER;
+  
+  --===================================================================================================================
+  --  Returns the database name
+  --===================================================================================================================
+  FUNCTION DB_NAME RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Returns the database host
+  --===================================================================================================================
+  FUNCTION DB_HOST RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Returns the database IP address
+  --===================================================================================================================
+  FUNCTION DB_IP RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Returns the host name of the connecting client this session was initiated by
+  --===================================================================================================================
+  FUNCTION CLIENT_HOST RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Returns the db user name for this session
+  --===================================================================================================================
+  FUNCTION DB_USER RETURN VARCHAR2;  
+  
+  --===================================================================================================================
+  --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
+  --===================================================================================================================
+  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
+  --===================================================================================================================
+  PROCEDURE CLEAN(str IN OUT NOCOPY VARCHAR2);
+  
+  
+END TSDB_UTIL;
+
+/
+--------------------------------------------------------
 --  DDL for Package TSDB_TRACER
 --------------------------------------------------------
 
@@ -470,6 +670,12 @@ end;
   no_metric_stack_entry EXCEPTION;
   /* Raised when an invalid depth is provided when adding or updating metrics in the specified stack entry */
   invalid_stack_depth EXCEPTION;
+  /* Raised when a TOMETRICS call via SQL or a REF CURSOR returns an unsupported type for the timestamp */
+  unsupported_timestamp_type EXCEPTION;
+  /* Raised when a timer is started but the timed metric is already in state */
+  timer_metric_already_started EXCEPTION;
+  /* Raised when a timer is stopped but the timed metric was never started */
+  timer_metric_never_started EXCEPTION;
   
     -- EOL Char
   EOL VARCHAR2(2) := '
@@ -481,6 +687,49 @@ end;
   --===================================================================================================================
   FUNCTION USERSTATS RETURN METRIC_ARR;
   
+  --===================================================================================================================
+  --  Starts a timer on a metric built from the passed name.
+  --  Returns the metric name.
+  --===================================================================================================================
+  FUNCTION STARTTIMER(metricName IN VARCHAR2) RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Starts a timer on the passed metric
+  --  Returns the metric name.
+  --===================================================================================================================
+  FUNCTION STARTTIMER(met_ric IN METRIC) RETURN VARCHAR2;
+  
+  --===================================================================================================================
+  --  Starts a timer on a metric built from the passed name.
+  --  Returns the metric.
+  --===================================================================================================================
+  FUNCTION STARTTIMERMETRIC(metricName IN VARCHAR2) RETURN METRIC;
+  
+  --===================================================================================================================
+  --  Starts a timer on the passed metric
+  --  Returns the metric.
+  --===================================================================================================================
+  FUNCTION STARTTIMERMETRIC(met_ric IN METRIC) RETURN METRIC;
+  
+  
+  --===================================================================================================================
+  --  Stops the named timer and returns the elapsed time metric.
+  --  The metric is removed from state.
+  --===================================================================================================================
+  FUNCTION STOPTIMER(metricName IN VARCHAR2) RETURN METRIC;
+  
+  --===================================================================================================================
+  --  Stops the timer for the passed metric and returns the elapsed time metric.
+  --  The metric is removed from state.
+  --===================================================================================================================
+  FUNCTION STOPTIMER(met_ric IN METRIC) RETURN METRIC;
+  
+
+  --===================================================================================================================
+  --  Clears all timers
+  --===================================================================================================================
+  PROCEDURE CLEARTIMERS;
+
 
   --====================================================================================================
   -- Attempts to convert the results from the passed ref-cursor to an array of metrics
@@ -556,103 +805,360 @@ END TSDB_TRACER;
 
 /
 --------------------------------------------------------
---  DDL for Package TSDB_UTIL
+--  DDL for Package Body TSDB_UTIL
 --------------------------------------------------------
 
-  CREATE OR REPLACE PACKAGE "TSDB_UTIL" AS 
+  CREATE OR REPLACE PACKAGE BODY "TSDB_UTIL" AS
 
-  -- Generic Ref Cursor
-  TYPE TRACECUR IS REF CURSOR;
-  -- Timestamp instance to extract stuff from but is unchanging
-  BASETS CONSTANT TIMESTAMP WITH TIME ZONE := SYSTIMESTAMP;
-  -- The timzone offset hours
-  TZHOUR CONSTANT PLS_INTEGER := extract(TIMEZONE_HOUR from BASETS);
-  -- The timzone offset hours
-  TZMINUTE CONSTANT PLS_INTEGER := extract(TIMEZONE_MINUTE from BASETS);  
-  -- The epoch timestamp
-  EPOCH CONSTANT TIMESTAMP := to_timestamp_tz('1970-01-01 ' || TZHOUR || ':' || TZMINUTE, 'YYYY-MM-DD TZH:TZM');  
-  -- TZ Offset hours/minutes converted to seconds
-  TZOFFSETSECS CONSTANT PLS_INTEGER := (TZHOUR*60*60) + (TZMINUTE*60);
-  -- TZ Offset hours/minutes converted to ms
-  TZOFFSETMS CONSTANT PLS_INTEGER := TZOFFSETSECS * 1000;
-  -- The default max buffer size for TSDBM instances
-  MAX_BUFFER_SIZE CONSTANT INT := 32767;
-  -- EOL Char
-  EOL VARCHAR2(2) := '
-';
-
+  /* The SID of the current session */
+  sid NUMBER;
+  /* The DB Name */
+  dbName VARCHAR2(30);
+  /* The DB host name */
+  dbHost VARCHAR2(30);  
+  /* The DB user name */
+  dbUser VARCHAR2(30);    
+  /* The DB IP Address */
+  dbIp VARCHAR2(30);  
+  /* The host name of the connected client */
+  clientHost VARCHAR2(30);
+  /* The user level stats names */
+  userStatKeys_ VARCHAR2_ARR := VARCHAR2_ARR(
+  'buffer_is_not_pinned_count',
+  'bytes_received_via_sqlnet_from_client',
+  'bytes_sent_via_sqlnet_to_client',
+  'calls_to_get_snapshot_scn:_kcmgss',
+  'calls_to_kcmgcs',
+  'ccursor_sql_area_evicted',
+  'consistent_gets',
+  'consistent_gets_examination',
+  'consistent_gets_examination_fastpath',
+  'consistent_gets_from_cache',
+  'consistent_gets_pin',
+  'consistent_gets_pin_fastpath',
+  'cpu_used_by_this_session',
+  'cpu_used_when_call_started',
+  'cursor_authentications',
+  'db_time',
+  'enqueue_releases',
+  'enqueue_requests',
+  'execute_count',
+  'index_fetch_by_key',
+  'index_scans_kdiixs1',
+  'logical_read_bytes_from_cache',
+  'no_work_consistent_read_gets',
+  'nonidle_wait_count',
+  'opened_cursors_cumulative',
+  'parse_count_hard',
+  'parse_count_total',
+  'parse_time_elapsed',
+  'recursive_calls',
+  'recursive_cpu_usage',
+  'requests_to_from_client',
+  'rows_fetched_via_callback',
+  'session_cursor_cache_count',
+  'session_cursor_cache_hits',
+  'session_logical_reads',
+  'sorts_memory',
+  'sorts_rows',
+  'sqlnet_roundtrips_to_from_client',
+  'table_fetch_by_rowid',
+  'user_calls',
+  'workarea_executions_optimal');  
   
   --===================================================================================================================
   --  Returns the cleaned user statistic keys
   --===================================================================================================================
-  FUNCTION USERSTATKEYS RETURN VARCHAR2_ARR;
-  
+  FUNCTION USERSTATKEYS RETURN VARCHAR2_ARR IS
+  BEGIN
+    RETURN userStatKeys_;
+  END USERSTATKEYS;
+
 
   --===================================================================================================================
   --  Returns the delta between the fromTime and the toTime in milliseconds
   --  The fromTime in mandatory
   --  The toTime will default to SYSTIMESTAMP if null
   --===================================================================================================================
-  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
+  BEGIN
+    RETURN ROUND(
+      (extract(day from delta)*24*60*60*1000) + 
+      (extract(hour from delta)*60*60*1000) + 
+      (extract(minute from delta)*60*1000) + 
+      extract(second from delta)*1000
+    ,0);
+  END ELAPSEDMS;
 
   --===================================================================================================================
   --  Returns the delta between the fromTime and the toTime in seconds
   --  The fromTime in mandatory
   --  The toTime will default to SYSTIMESTAMP if null
   --===================================================================================================================
-  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER;
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
+  BEGIN
+    RETURN ROUND(
+      (extract(day from delta)*24*60*60) + 
+      (extract(hour from delta)*60*60) + 
+      (extract(minute from delta)*60) + 
+      extract(second from delta)
+    ,0);
+  END ELAPSEDSEC;
+   
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in milliseconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
+    ms NUMBER;
+  BEGIN
+    ms := ROUND(
+      (
+      (extract(day from delta)*24*60*60) + 
+      (extract(hour from delta)*60*60) + 
+      (extract(minute from delta)*60) + 
+      extract(second from delta)
+      ) * 1000
+    ,0);
+    RETURN ms;
+  END ELAPSEDMS;
   
+--declare
+--  fromtime TIMESTAMP := to_timestamp('22-DEC-16 04.51.19.476673000 PM', 'DD-MM-RR HH.MI.SS.FF AM');
+--  totime TIMESTAMP := to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM');
+--  delta CONSTANT INTERVAL DAY (9) TO SECOND  := totime - fromtime;
+--  elapsed NUMBER;
+--begin
+--  DBMS_OUTPUT.PUT_LINE('INTERVAL:' || delta);
+--  elapsed := TSDB_UTIL.ELAPSEDMS(fromtime, totime);
+----  elapsed :=   
+----  ROUND(
+----    (extract(day from delta)*24*60*60*1000) + 
+----    (extract(hour from delta)*60*60*1000) + 
+----    (extract(minute from delta)*60*1000) + 
+----    extract(second from delta)*1000
+----  ,0);
+--  DBMS_OUTPUT.PUT_LINE('ELAPSED:' || elapsed);
+--end;  
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in seconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSTIMESTAMP if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
+  BEGIN
+    RETURN ROUND(
+      (extract(day from delta)*24*60*60) + 
+      (extract(hour from delta)*60*60) + 
+      (extract(minute from delta)*60) + 
+      extract(second from delta)
+    ,0);
+  END ELAPSEDSEC;
+  
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in milliseconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSDATE if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN DATE DEFAULT SYSDATE) RETURN NUMBER IS
+  BEGIN
+    RETURN ELAPSEDMS(fromTime, DATETOTIMESTAMP(toTime));
+  END ELAPSEDMS;
+
+  --===================================================================================================================
+  --  Returns the delta between the fromTime and the toTime in seconds
+  --  The fromTime in mandatory
+  --  The toTime will default to SYSDATE if null
+  --===================================================================================================================
+  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN DATE DEFAULT SYSDATE) RETURN NUMBER IS
+  BEGIN
+    RETURN ELAPSEDSEC(fromTime, DATETOTIMESTAMP(toTime));
+  END ELAPSEDSEC;
+  
+  
+  --==================================================================================================
+  -- Converts the passed date to a timestamp with as high precision as possible.
+  -- The passed date defaults to 'SYSDATE'
+  -- Additional fractional seconds can be specified to add precision.
+  --==================================================================================================
+  FUNCTION DATETOTIMESTAMP(dt IN DATE DEFAULT SYSDATE, fs IN INTEGER DEFAULT 0) RETURN TIMESTAMP IS
+  BEGIN
+    RETURN TO_TIMESTAMP(
+      TO_CHAR(dt, 'DD-Mon-RR HH24:MI:SS') || '.' || fs,
+      'DD-Mon-RR HH24:MI:SS.FF');
+  END DATETOTIMESTAMP;
+
+
   --===================================================================================================================
   --  Returns the current time as the number of milliseconds since epoch (like java.lang.System.getCurrentTimeMillis())
   --===================================================================================================================
-  FUNCTION CURRENTMS RETURN NUMBER;
-  
+  FUNCTION CURRENTMS RETURN NUMBER AS
+    now TIMESTAMP := SYSTIMESTAMP;
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := now - EPOCH;
+  BEGIN  
+    RETURN ROUND(
+      (extract(day from delta)*24*60*60*1000) + 
+      (extract(hour from delta)*60*60*1000) + 
+      (extract(minute from delta)*60*1000) + 
+      extract(second from delta)*1000
+       - (TZOFFSETSECS * 1000)
+      + to_number(to_char(sys_extract_utc(now), 'FF3'))
+    ,0);
+  END CURRENTMS;
+
   --===================================================================================================================
   --  Returns the current time as the number of seconds since epoch (unix time)
   --===================================================================================================================
-  FUNCTION CURRENTSEC RETURN NUMBER;
+  FUNCTION CURRENTSEC RETURN NUMBER AS
+    delta CONSTANT INTERVAL DAY (9) TO SECOND  := SYSTIMESTAMP - EPOCH;
+  BEGIN  
+    RETURN ROUND(
+      (extract(day from delta)*24*60*60) + 
+      (extract(hour from delta)*60*60) + 
+      (extract(minute from delta)*60) + 
+      extract(second from delta) - TZOFFSETSECS
+    ,0);
+  END CURRENTSEC;
+  
+  --===================================================================================================================
+  --  Determines how many digits are in the passed number
+  --===================================================================================================================
+  FUNCTION DIGITS(n IN NUMBER DEFAULT 0) RETURN INT AS
+    rn NUMBER := ROUND(n,0);
+  BEGIN
+    IF(rn=0) THEN 
+      RETURN 1; 
+    ELSE
+      RETURN ROUND(LOG(10,rn),0);
+    END IF;
+  END DIGITS;
+  
+  --===================================================================================================================
+  --  Determines if the passed number is most likely SECONDS or MILLISECONDS and returns the value in MILLISECONDS
+  --===================================================================================================================
+  FUNCTION TOMS(n IN NUMBER DEFAULT 0) RETURN NUMBER IS
+  BEGIN
+    IF(n=0) THEN
+      RETURN 0;      
+    ELSIF(DIGITS(n) < 13) THEN
+      -- SECONDS
+      RETURN n * 1000;
+    ELSE
+      -- MILLISECONDS
+      RETURN n;
+    END IF;
+  END TOMS;
+  
+  --===================================================================================================================
+  --  Determines if the passed number is most likely SECONDS or MILLISECONDS and returns the value in SECONDS
+  --===================================================================================================================
+  FUNCTION TOSEC(n IN NUMBER DEFAULT 0) RETURN NUMBER IS
+  BEGIN
+    IF(n=0) THEN
+      RETURN 0;      
+    ELSIF(DIGITS(n) < 13) THEN
+      -- SECONDS
+      RETURN n;
+    ELSE
+      -- MILLISECONDS
+      RETURN n/1000;
+    END IF;
+  END TOSEC;
+  
   
   --===================================================================================================================
   --  Returns the sid for the current session
   --===================================================================================================================
-  FUNCTION SESSION_SID RETURN NUMBER;
+  FUNCTION SESSION_SID RETURN NUMBER IS
+  BEGIN
+    RETURN sid;
+  END SESSION_SID;
   
   --===================================================================================================================
   --  Returns the database name
   --===================================================================================================================
-  FUNCTION DB_NAME RETURN VARCHAR2;
-  
+  FUNCTION DB_NAME RETURN VARCHAR2 IS
+  BEGIN
+    RETURN dbName;
+  END DB_NAME;
+
   --===================================================================================================================
   --  Returns the database host
   --===================================================================================================================
-  FUNCTION DB_HOST RETURN VARCHAR2;
-  
+  FUNCTION DB_HOST RETURN VARCHAR2 IS
+  BEGIN
+    RETURN dbHost;
+  END DB_HOST;
+
   --===================================================================================================================
   --  Returns the database IP address
   --===================================================================================================================
-  FUNCTION DB_IP RETURN VARCHAR2;
-  
+  FUNCTION DB_IP RETURN VARCHAR2 IS
+  BEGIN
+    RETURN dbIp;
+  END DB_IP;
+
   --===================================================================================================================
   --  Returns the host name of the connecting client this session was initiated by
   --===================================================================================================================
-  FUNCTION CLIENT_HOST RETURN VARCHAR2;
+  FUNCTION CLIENT_HOST RETURN VARCHAR2 IS
+  BEGIN
+    RETURN clientHost;
+  END CLIENT_HOST;
   
   --===================================================================================================================
   --  Returns the db user name for this session
   --===================================================================================================================
-  FUNCTION DB_USER RETURN VARCHAR2;  
+  FUNCTION DB_USER RETURN VARCHAR2 IS
+  BEGIN
+    RETURN dbUser;
+  END DB_USER;
+  
   
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
-  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2;
+  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2 IS
+    cs VARCHAR2(360);
+  BEGIN
+    IF(str IS NULL) THEN 
+      RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was null');
+    END IF;
+    --cs := TRANSLATE(RTRIM(LTRIM(LOWER(str))), ' /*().+%', '__');
+    cs := TRANSLATE(TRIM(LOWER(str)), ' /*()+%', '__');
+    IF(cs IS NULL) THEN 
+      RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was empty');
+    END IF;    
+    RETURN cs;
+  END CLEAN;
   
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
-  PROCEDURE CLEAN(str IN OUT NOCOPY VARCHAR2);
+  PROCEDURE CLEAN(str IN OUT NOCOPY VARCHAR2) IS
+  BEGIN
+    str := CLEAN(str);
+  END CLEAN;
   
-  
+
+  --===================================================================================================================
+  --  Initializes the session info for this session
+  --===================================================================================================================
+  BEGIN
+    SELECT 
+      SYS_CONTEXT('USERENV', 'SID'),
+      SYS_CONTEXT('USERENV', 'DB_NAME'),
+      SYS_CONTEXT('USERENV', 'SERVER_HOST'),
+      SYS_CONTEXT('USERENV', 'IP_ADDRESS'),
+      SYS_CONTEXT('USERENV', 'HOST'),
+      USER
+      INTO sid, dbName, dbHost, dbIp, clientHost, dbUser FROM DUAL;    
 END TSDB_UTIL;
 
 /
@@ -677,6 +1183,99 @@ END TSDB_UTIL;
     --FETCH p BULK COLLECT INTO r;
     RETURN REFCURTOMETRICS(p);
   END TOMETRICS;
+  
+  --===================================================================================================================
+  --  Starts a timer on a metric built from the passed name.
+  --  Returns the metric name.
+  --===================================================================================================================
+  FUNCTION STARTTIMER(metricName IN VARCHAR2) RETURN VARCHAR2 IS
+    m METRIC;
+  BEGIN
+    m := METRIC.PARSEMETRIC(metricName);
+    RETURN STARTTIMER(m);
+  END STARTTIMER;
+  
+  --===================================================================================================================
+  --  Starts a timer on the passed metric
+  --  Returns the metric name.
+  --===================================================================================================================
+  FUNCTION STARTTIMER(met_ric IN METRIC) RETURN VARCHAR2 IS
+    mkey VARCHAR2(100) := met_ric.METRICKEY();
+    m METRIC := met_ric;
+  BEGIN
+    IF(timers.EXISTS(mkey)) THEN
+      RAISE timer_metric_already_started;
+    END IF;
+    timers(mkey) := m.OPEN();
+    RETURN mkey;
+  END STARTTIMER;
+  
+  --===================================================================================================================
+  --  Starts a timer on the passed metric
+  --  Returns the metric.
+  --===================================================================================================================
+  FUNCTION STARTTIMERMETRIC(met_ric IN METRIC) RETURN METRIC IS
+    mkey VARCHAR2(100) := met_ric.METRICKEY();
+    m METRIC;
+  BEGIN
+    IF(timers.EXISTS(mkey)) THEN
+      RAISE timer_metric_already_started;
+    END IF;
+    m := met_ric.OPEN();
+    timers(mkey) := m;
+    RETURN m;
+  END STARTTIMERMETRIC;
+  
+  --===================================================================================================================
+  --  Starts a timer on a metric built from the passed name.
+  --  Returns the metric.
+  --===================================================================================================================
+  FUNCTION STARTTIMERMETRIC(metricName IN VARCHAR2) RETURN METRIC IS
+    m METRIC;
+  BEGIN
+    m := METRIC.PARSEMETRIC(metricName);
+    RETURN STARTTIMERMETRIC(m);
+  END STARTTIMERMETRIC;
+  
+  
+  
+  --===================================================================================================================
+  --  Stops the named timer and returns the elapsed time metric.
+  --  The metric is removed from state.
+  --===================================================================================================================
+  FUNCTION STOPTIMER(metricName IN VARCHAR2) RETURN METRIC IS
+    m METRIC;
+  BEGIN
+    m := METRIC.PARSEMETRIC(metricName);
+    RETURN STOPTIMER(m);
+  END STOPTIMER;
+  
+  --===================================================================================================================
+  --  Stops the timer for the passed metric and returns the elapsed time metric.
+  --  The metric is removed from state.
+  --===================================================================================================================
+  FUNCTION STOPTIMER(met_ric IN METRIC) RETURN METRIC IS
+    mkey CONSTANT VARCHAR2(100) := met_ric.METRICKEY();
+    elapsed METRIC;
+  BEGIN
+    IF(timers.EXISTS(mkey)) THEN
+      elapsed := timers(mkey).CLOSE();
+      timers.DELETE(mkey);
+    ELSE
+      RAISE timer_metric_never_started;
+    END IF;
+    RETURN elapsed;
+  END STOPTIMER;
+  
+  --===================================================================================================================
+  --  Clears all timers
+  --===================================================================================================================
+  PROCEDURE CLEARTIMERS IS
+  BEGIN
+    timers.DELETE();
+  END CLEARTIMERS;
+  
+  
   
   
 
@@ -909,8 +1508,8 @@ END TSDB_UTIL;
     END LOOP;
     DBMS_LOB.WRITEAPPEND(content, 1, ']');    
     LOGGING.tcplog(content);
-    --req := UTL_HTTP.BEGIN_REQUEST (url=> 'http://pdk-pt-cltsdb-05.intcx.net:4242/api/put', method => 'POST');
-    req := UTL_HTTP.BEGIN_REQUEST (url=> 'http://localhost:4242/api/put', method => 'POST');
+    req := UTL_HTTP.BEGIN_REQUEST (url=> 'http://pdk-pt-cltsdb-05.intcx.net:4242/api/put', method => 'POST');
+    --req := UTL_HTTP.BEGIN_REQUEST (url=> 'http://localhost:4242/api/put', method => 'POST');
     --UTL_HTTP.set_persistent_conn_support(req,true);
     UTL_HTTP.SET_HEADER (r      =>  req,
                        name   =>  'Content-Type',
@@ -972,10 +1571,12 @@ END TSDB_UTIL;
   FUNCTION CURSORINTTOMETRICS(cursorNum IN OUT NOCOPY NUMBER) RETURN METRIC_ARR IS
     cntr PLS_INTEGER := 0;
     rows_processed INTEGER;    
-    desctab  DBMS_SQL.DESC_TAB2;
+    desctab  DBMS_SQL.DESC_TAB3;
     colcnt   NUMBER;   
     colnum INT;
     hasTs BOOLEAN;
+    tsType PLS_INTEGER := NULL;
+    tsTypeName VARCHAR2(200);
     tId PLS_INTEGER := 3;
     tagCount PLS_INTEGER;
     met METRIC := NULL;
@@ -984,11 +1585,13 @@ END TSDB_UTIL;
     metValue NUMBER;
     tagK VARCHAR2(100);
     tagV VARCHAR2(100);
-    rowsFetched PLS_INTEGER := 0;
-    execRows PLS_INTEGER := 0;
-    ts TIMESTAMP;
+    rowsFetched PLS_INTEGER := 0;    
+    tsTimestamp TIMESTAMP;
+    tsTimestampWTimeZone TIMESTAMP WITH TIME ZONE;
+    tsDate DATE;
+    tsNumber NUMBER;
   BEGIN
-    DBMS_SQL.DESCRIBE_COLUMNS2(cursorNum, colcnt, desctab);
+    DBMS_SQL.DESCRIBE_COLUMNS3(cursorNum, colcnt, desctab);
     IF(colcnt < 2) THEN
       RETURN metrics;
     END IF;
@@ -1001,14 +1604,41 @@ END TSDB_UTIL;
     DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, metValue); 
     DBMS_SQL.DEFINE_COLUMN(cursorNum, 2, metName, 100); 
     IF(hasTs) THEN
-      IF(desctab(colcnt).col_type = DBMS_TYPES.TYPECODE_TIMESTAMP) THEN
-        DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, ts, DBMS_TYPES.TYPECODE_TIMESTAMP); 
-      END IF;
+      tsType := desctab(colcnt).col_type;
+      tsTypeName := desctab(colcnt).col_type_name;
+      LOGGING.tcplog('TSTYPE: [' || tsType || '], TS NAME: [' || tsTypeName || '], COLCNT: [' || colcnt || ']');
+      CASE tsType
+--        WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsTimestamp, DBMS_TYPES.TYPECODE_TIMESTAMP);
+--        WHEN 181 THEN
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsTimestampWTimeZone, DBMS_TYPES.TYPECODE_TIMESTAMP_TZ);          
+--        WHEN DBMS_TYPES.TYPECODE_DATE THEN
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsDate, DBMS_TYPES.TYPECODE_DATE);
+--        WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsNumber, DBMS_TYPES.TYPECODE_NUMBER);
+        WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
+          LOGGING.tcplog('DEFINE TIMESTAMP');
+          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt,  tsTimestamp);
+        WHEN 181 THEN
+          LOGGING.tcplog('DEFINE TIMESTAMP WITH TZ');
+          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsTimestampWTimeZone);          
+        WHEN DBMS_TYPES.TYPECODE_DATE THEN
+          LOGGING.tcplog('DEFINE DATE');
+          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsDate);
+        WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
+          LOGGING.tcplog('DEFINE NUMBER');
+          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsNumber);
+        ELSE
+          RAISE unsupported_timestamp_type;
+      END CASE;
     END IF;
     FOR i IN 1..tagCount LOOP
-      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, tagK, 100);
+      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, DBMS_TYPES.TYPECODE_VARCHAR2, 100);
+      LOGGING.tcplog('Bound Tag Key [' || i || '] at position [' || tId || ']');
       tId := tId + 1;
-      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, tagV, 100);
+      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, DBMS_TYPES.TYPECODE_VARCHAR2, 100);
+      --DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, tagV, 100);
+      LOGGING.tcplog('Bound Tag Value [' || i || '] at position [' || tId || ']');
       tId := tId + 1;
     END LOOP;
     tId := 3;
@@ -1028,6 +1658,22 @@ END TSDB_UTIL;
         tId := tId + 1;
         met := met.PUSHTAG(tagK, tagV);
       END LOOP;
+      IF(hasTs) THEN
+        CASE tsType
+          WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
+            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestamp);
+            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestamp));
+          WHEN 181 THEN
+            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestampWTimeZone);
+            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestampWTimeZone));            
+          WHEN DBMS_TYPES.TYPECODE_DATE THEN
+            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsDate);
+            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, TSDB_UTIL.DATETOTIMESTAMP(tsDate)));
+          WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
+            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsNumber);
+            met := met.ts(tsNumber);
+          END CASE;
+      END IF;
       tId := 3;
       metrics.EXTEND();
       metrics(cntr) := met;
@@ -1083,17 +1729,17 @@ END TSDB_UTIL;
     cursorNum := dbms_sql.open_cursor();
     DBMS_SQL.PARSE(cursorNum, query, DBMS_SQL.NATIVE);     
     RETURN CURSORINTTOMETRICS(cursorNum);
-    EXCEPTION WHEN OTHERS THEN
-      BEGIN
-        DBMS_SQL.CLOSE_CURSOR(cursorNum);    
-        EXCEPTION WHEN OTHERS THEN NULL;
-      END;
-      DECLARE
-        errm VARCHAR2(200) := SQLERRM();
-      BEGIN
-        LOGGING.tcplog('SQLTOMETRICS(REF CUR) ERROR: errm:' || errm || ', backtrace:' || dbms_utility.format_error_backtrace);
-      END;
-      RAISE;                        
+--    EXCEPTION WHEN OTHERS THEN
+--      BEGIN
+--        DBMS_SQL.CLOSE_CURSOR(cursorNum);    
+--        EXCEPTION WHEN OTHERS THEN NULL;
+--      END;
+--      DECLARE
+--        errm VARCHAR2(200) := SQLERRM();
+--      BEGIN
+--        LOGGING.tcplog('SQLTOMETRICS(REF CUR) ERROR: errm:' || errm || ', backtrace:' || dbms_utility.format_error_backtrace);
+--      END;
+--      RAISE;                        
   END SQLTOMETRICS;
   
   
@@ -1185,231 +1831,67 @@ select value(t) from table(tsdb_tracer.sqltometrics(
         SELECT COLUMN_VALUE FROM TABLE(TSDB_UTIL.USERSTATKEYS())
         WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
       )#')) t;
+      
+      
+declare
+  tags TAGPAIR_ARR := TAGPAIR_ARR(TAGPAIR('aaa', 'zzz'), TAGPAIR('bbb', 'yyy'), TAGPAIR('ccc', 'xxx'));
+  cnt INT := -1;
+begin
+  SELECT COUNT(*) INTO cnt FROM TABLE(tags) T WHERE K = 'aaa';
+  DBMS_OUTPUT.PUT_LINE('COUNT of aaa:' || cnt);
+  SELECT R INTO cnt FROM (SELECT ROWNUM R, T.K KEY FROM TABLE(tags) T) V WHERE V.KEY = 'bbb';
+  DBMS_OUTPUT.PUT_LINE('OFFSET of bbb:' || cnt);
+  INSERT INTO TABLE(tags) VALUES('eee', 'www');
+end;
+
+
+--select * from table(tsdb_tracer.sqltometrics(
+--  q'#      SELECT M.VALUE, TSDB_UTIL.CLEAN(N.NAME) NAME, 'CLASS', TSDB_TRACER.DECODE_CLASS(N.CLASS) CLAZZ, 'FOO', 'BAR', SYSDATE - 1000
+--      FROM v$mystat M, v$statname N
+--      WHERE M.STATISTIC# = N.STATISTIC#
+--      AND EXISTS (
+--        SELECT COLUMN_VALUE FROM TABLE(TSDB_UTIL.USERSTATKEYS())
+--        WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
+--      )#')) t;
+
+begin TSDB_TRACER.CLEARTIMERS; END;
+
+select TSDB_TRACER.STARTTIMERMETRIC(METRIC.PARSEMETRIC('sys.cpu:xhost=BBB'))
+  .SLEEP(5)
+  .CLOSE().JSONMS()
+  from dual;
+  
+select TSDB_TRACER.STOPTIMER('sys.cpu:host=aaa,host=rv-wk-dmon-03,app=orcl,user=pltsdb').JSONMS() from dual;
+
+-- 22-DEC-16 04.51.24.491343 PM], st: [22-DEC-16 04.51.19.476673000 PM]
+select to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM') from dual
+
+select to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM')  - to_timestamp('22-DEC-16 04.51.19.476673000 PM', 'DD-MM-RR HH.MI.SS.FF AM')
+from dual
+
+declare
+  fromtime TIMESTAMP := to_timestamp('22-DEC-16 04.51.19.476673000 PM', 'DD-MM-RR HH.MI.SS.FF AM');
+  totime TIMESTAMP := to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM');
+  delta CONSTANT INTERVAL DAY (9) TO SECOND  := totime - fromtime;
+  elapsed NUMBER;
+begin
+  DBMS_OUTPUT.PUT_LINE('INTERVAL:' || delta);
+  elapsed := TSDB_UTIL.ELAPSEDMS(fromtime, totime);
+--  elapsed := ROUND(
+--      (
+--      (extract(day from delta)*24*60*60) + 
+--      (extract(hour from delta)*60*60) + 
+--      (extract(minute from delta)*60) + 
+--      extract(second from delta)
+--      ) * 1000
+--    ,0);  
+  DBMS_OUTPUT.PUT_LINE('ELAPSED:' || elapsed);
+end;
+
+
+
+
+      
 */
-
-/
---------------------------------------------------------
---  DDL for Package Body TSDB_UTIL
---------------------------------------------------------
-
-  CREATE OR REPLACE PACKAGE BODY "TSDB_UTIL" AS
-
-  /* The SID of the current session */
-  sid NUMBER;
-  /* The DB Name */
-  dbName VARCHAR2(30);
-  /* The DB host name */
-  dbHost VARCHAR2(30);  
-  /* The DB user name */
-  dbUser VARCHAR2(30);    
-  /* The DB IP Address */
-  dbIp VARCHAR2(30);  
-  /* The host name of the connected client */
-  clientHost VARCHAR2(30);
-  /* The user level stats names */
-  userStatKeys_ VARCHAR2_ARR := VARCHAR2_ARR(
-  'buffer_is_not_pinned_count',
-  'bytes_received_via_sqlnet_from_client',
-  'bytes_sent_via_sqlnet_to_client',
-  'calls_to_get_snapshot_scn:_kcmgss',
-  'calls_to_kcmgcs',
-  'ccursor_sql_area_evicted',
-  'consistent_gets',
-  'consistent_gets_examination',
-  'consistent_gets_examination_fastpath',
-  'consistent_gets_from_cache',
-  'consistent_gets_pin',
-  'consistent_gets_pin_fastpath',
-  'cpu_used_by_this_session',
-  'cpu_used_when_call_started',
-  'cursor_authentications',
-  'db_time',
-  'enqueue_releases',
-  'enqueue_requests',
-  'execute_count',
-  'index_fetch_by_key',
-  'index_scans_kdiixs1',
-  'logical_read_bytes_from_cache',
-  'no_work_consistent_read_gets',
-  'nonidle_wait_count',
-  'opened_cursors_cumulative',
-  'parse_count_hard',
-  'parse_count_total',
-  'parse_time_elapsed',
-  'recursive_calls',
-  'recursive_cpu_usage',
-  'requests_to_from_client',
-  'rows_fetched_via_callback',
-  'session_cursor_cache_count',
-  'session_cursor_cache_hits',
-  'session_logical_reads',
-  'sorts_memory',
-  'sorts_rows',
-  'sqlnet_roundtrips_to_from_client',
-  'table_fetch_by_rowid',
-  'user_calls',
-  'workarea_executions_optimal');  
-  
-  --===================================================================================================================
-  --  Returns the cleaned user statistic keys
-  --===================================================================================================================
-  FUNCTION USERSTATKEYS RETURN VARCHAR2_ARR IS
-  BEGIN
-    RETURN userStatKeys_;
-  END USERSTATKEYS;
-
-
-  --===================================================================================================================
-  --  Returns the delta between the fromTime and the toTime in milliseconds
-  --  The fromTime in mandatory
-  --  The toTime will default to SYSTIMESTAMP if null
-  --===================================================================================================================
-  FUNCTION ELAPSEDMS(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
-    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
-  BEGIN
-    RETURN ROUND(
-      (extract(day from delta)*24*60*60*1000) + 
-      (extract(hour from delta)*60*60*1000) + 
-      (extract(minute from delta)*60*1000) + 
-      extract(second from delta*1000)
-    ,0);
-  END ELAPSEDMS;
-
-  --===================================================================================================================
-  --  Returns the delta between the fromTime and the toTime in seconds
-  --  The fromTime in mandatory
-  --  The toTime will default to SYSTIMESTAMP if null
-  --===================================================================================================================
-  FUNCTION ELAPSEDSEC(fromTime IN TIMESTAMP, toTime IN TIMESTAMP DEFAULT SYSTIMESTAMP) RETURN NUMBER AS
-    delta CONSTANT INTERVAL DAY (9) TO SECOND  := toTime - fromTime;
-  BEGIN
-    RETURN ROUND(
-      (extract(day from delta)*24*60*60) + 
-      (extract(hour from delta)*60*60) + 
-      (extract(minute from delta)*60) + 
-      extract(second from delta)
-    ,0);
-  END ELAPSEDSEC;
-
-
-  --===================================================================================================================
-  --  Returns the current time as the number of milliseconds since epoch (like java.lang.System.getCurrentTimeMillis())
-  --===================================================================================================================
-  FUNCTION CURRENTMS RETURN NUMBER AS
-    now TIMESTAMP := SYSTIMESTAMP;
-    delta CONSTANT INTERVAL DAY (9) TO SECOND  := now - EPOCH;
-  BEGIN  
-    RETURN ROUND(
-      (extract(day from delta)*24*60*60*1000) + 
-      (extract(hour from delta)*60*60*1000) + 
-      (extract(minute from delta)*60*1000) + 
-      extract(second from delta)*1000
-       - (TZOFFSETSECS * 1000)
-      + to_number(to_char(sys_extract_utc(now), 'FF3'))
-    ,0);
-  END CURRENTMS;
-
-  --===================================================================================================================
-  --  Returns the current time as the number of seconds since epoch (unix time)
-  --===================================================================================================================
-  FUNCTION CURRENTSEC RETURN NUMBER AS
-    delta CONSTANT INTERVAL DAY (9) TO SECOND  := SYSTIMESTAMP - EPOCH;
-  BEGIN  
-    RETURN ROUND(
-      (extract(day from delta)*24*60*60) + 
-      (extract(hour from delta)*60*60) + 
-      (extract(minute from delta)*60) + 
-      extract(second from delta) - TZOFFSETSECS
-    ,0);
-  END CURRENTSEC;
-  
-  --===================================================================================================================
-  --  Returns the sid for the current session
-  --===================================================================================================================
-  FUNCTION SESSION_SID RETURN NUMBER IS
-  BEGIN
-    RETURN sid;
-  END SESSION_SID;
-  
-  --===================================================================================================================
-  --  Returns the database name
-  --===================================================================================================================
-  FUNCTION DB_NAME RETURN VARCHAR2 IS
-  BEGIN
-    RETURN dbName;
-  END DB_NAME;
-
-  --===================================================================================================================
-  --  Returns the database host
-  --===================================================================================================================
-  FUNCTION DB_HOST RETURN VARCHAR2 IS
-  BEGIN
-    RETURN dbHost;
-  END DB_HOST;
-
-  --===================================================================================================================
-  --  Returns the database IP address
-  --===================================================================================================================
-  FUNCTION DB_IP RETURN VARCHAR2 IS
-  BEGIN
-    RETURN dbIp;
-  END DB_IP;
-
-  --===================================================================================================================
-  --  Returns the host name of the connecting client this session was initiated by
-  --===================================================================================================================
-  FUNCTION CLIENT_HOST RETURN VARCHAR2 IS
-  BEGIN
-    RETURN clientHost;
-  END CLIENT_HOST;
-  
-  --===================================================================================================================
-  --  Returns the db user name for this session
-  --===================================================================================================================
-  FUNCTION DB_USER RETURN VARCHAR2 IS
-  BEGIN
-    RETURN dbUser;
-  END DB_USER;
-  
-  
-  --===================================================================================================================
-  --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
-  --===================================================================================================================
-  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2 IS
-    cs VARCHAR2(360);
-  BEGIN
-    IF(str IS NULL) THEN 
-      RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was null');
-    END IF;
-    --cs := TRANSLATE(RTRIM(LTRIM(LOWER(str))), ' /*().+%', '__');
-    cs := TRANSLATE(TRIM(LOWER(str)), ' /*()+%', '__');
-    IF(cs IS NULL) THEN 
-      RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was empty');
-    END IF;    
-    RETURN cs;
-  END CLEAN;
-  
-  --===================================================================================================================
-  --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
-  --===================================================================================================================
-  PROCEDURE CLEAN(str IN OUT NOCOPY VARCHAR2) IS
-  BEGIN
-    str := CLEAN(str);
-  END CLEAN;
-  
-
-  --===================================================================================================================
-  --  Initializes the session info for this session
-  --===================================================================================================================
-  BEGIN
-    SELECT 
-      SYS_CONTEXT('USERENV', 'SID'),
-      SYS_CONTEXT('USERENV', 'DB_NAME'),
-      SYS_CONTEXT('USERENV', 'SERVER_HOST'),
-      SYS_CONTEXT('USERENV', 'IP_ADDRESS'),
-      SYS_CONTEXT('USERENV', 'HOST'),
-      USER
-      INTO sid, dbName, dbHost, dbIp, clientHost, dbUser FROM DUAL;    
-END TSDB_UTIL;
 
 /
