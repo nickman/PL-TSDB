@@ -1,0 +1,21 @@
+--------------------------------------------------------
+--  File created - Friday-December-23-2016   
+--------------------------------------------------------
+@D:\hprojects\PL-TSDB\METRIC.sql
+@D:\hprojects\PL-TSDB\METRIC_ARR.sql
+@D:\hprojects\PL-TSDB\METRIC_EXT.sql
+@D:\hprojects\PL-TSDB\METRIC_EXT_ARR.sql
+@D:\hprojects\PL-TSDB\TAGPAIR.sql
+@D:\hprojects\PL-TSDB\TAGPAIR_ARR.sql
+@D:\hprojects\PL-TSDB\VARCHAR2_ARR.sql
+@D:\hprojects\PL-TSDB\TSDB_CONFIG.sql
+@D:\hprojects\PL-TSDB\TSDB_METRIC_QUEUE.sql
+@D:\hprojects\PL-TSDB\TSDB_METRIC_TAGSTORE.sql
+@D:\hprojects\PL-TSDB\SYS_C0039588.sql
+@D:\hprojects\PL-TSDB\SYS_C0039587.sql
+@D:\hprojects\PL-TSDB\SYS_C0033870.sql
+@D:\hprojects\PL-TSDB\SYS_FK0000118682N00004_.sql
+@D:\hprojects\PL-TSDB\TSDB_TRACER.sql
+@D:\hprojects\PL-TSDB\TSDB_UTIL.sql
+@D:\hprojects\PL-TSDB\TSDB_TRACER_1.sql
+@D:\hprojects\PL-TSDB\TSDB_UTIL_1.sql
