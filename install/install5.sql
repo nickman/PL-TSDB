@@ -171,6 +171,9 @@
   PROCEDURE TRACE(metrics IN METRIC_ARR);
   -- Trace a metric
   PROCEDURE TRACE(metric IN METRIC);
+  -- Trace all metrics and return a count
+  FUNCTION TRACEF(metrics IN METRIC_ARR) RETURN METRIC_ARR;
+
   
   FUNCTION INDIRECT(p IN SYS_REFCURSOR) RETURN SYS_REFCURSOR;
   
@@ -630,6 +633,14 @@ END TSDB_TRACER;
   BEGIN
     TRACE(METRIC_ARR(metric));
   END TRACE;
+
+  -- Trace all metrics and return the array
+  FUNCTION TRACEF(metrics IN METRIC_ARR) RETURN METRIC_ARR IS
+  BEGIN
+    TRACE(metrics);
+    RETURN metrics;
+  END TRACEF;
+  
   
   -- Trace all metrics
   PROCEDURE TRACE(metrics IN METRIC_ARR) IS

@@ -75,6 +75,10 @@
   TRACE_TELNET CONSTANT VARCHAR2(6) := 'TELNET';
   TRACE_TABLE CONSTANT VARCHAR2(5) := 'TABLE';
   
+  --============================================================================
+  -- Converts a number to varchar2, prepending a 0 if requiured
+  --============================================================================
+  FUNCTION NTOV(val IN NUMBER) RETURN VARCHAR2;
 
 
   --============================================================================
@@ -414,7 +418,7 @@ END TSDB_UTIL;
   -- Logging Level Key
   CONFIG_LOGGING_LEVEL CONSTANT VARCHAR2(30) := 'logging.level';
   -- Default Logging Level
-  DEFAULT_LOGGING_LEVEL CONSTANT PLS_INTEGER := 1; 
+  DEFAULT_LOGGING_LEVEL CONSTANT PLS_INTEGER := 2; 
   -- Valid logging levels: 0: OFF, 1: ERROR, 2: INFO, 3:ALL
   VALID_LOGGING_LEVELS CONSTANT INT_ARR := INT_ARR(LEVEL_OFF, LEVEL_ERROR, LEVEL_INFO, LEVEL_ALL);
 
@@ -494,6 +498,18 @@ END TSDB_UTIL;
 
   -- Configured Logging DBMS_ALERT Alert Name
   alertLoggingName VARCHAR2(2000);
+
+  --============================================================================
+  -- Converts a number to varchar2, prepending a 0 if requiured
+  --============================================================================
+  FUNCTION NTOV(val IN NUMBER) RETURN VARCHAR2 IS
+  BEGIN
+    IF(val IS NULL) THEN RETURN '0'; END IF;
+    IF(val < 1 AND val > 0) THEN
+      RETURN '0' || val;
+    END IF;
+    RETURN '' || val;
+  END NTOV;
 
 
   --============================================================================

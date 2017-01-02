@@ -19,7 +19,7 @@ CREATE OR REPLACE TYPE BODY TAGPAIR as
 
   member function json return varchar2 as
     begin    
-      return '' || K || ':' || V || '';
+      return '"' || K || '":"' || V || '"';
     end json;
     
   MEMBER FUNCTION PUT RETURN VARCHAR2 IS
@@ -349,12 +349,12 @@ CREATE OR REPLACE TYPE BODY METRIC AS
       resolvedTs := NVL(ts, met_ric.TSTAMP)/1000;
     END IF;
     IF(asJson) THEN
-      met := '{metric:' || met_ric.METRICNAME || ',value:' || met_ric.VALUE || ',timestamp:' || resolvedTs || ',tags:{';
+      met := '{"metric":"' || met_ric.METRICNAME || '","value":' ||  TSDB_UTIL.NTOV(met_ric.VALUE) || ',"timestamp":' || resolvedTs || ',"tags":{';
       delim := ',';
       endchar := '}}';
     ELSE
       -- put $metric $now $value dc=$DC host=$HOST
-      met := 'put ' || met_ric.METRICNAME || ' ' || resolvedTs || ' ' || met_ric.VALUE || ' ';
+      met := 'put ' || met_ric.METRICNAME || ' ' || resolvedTs || ' ' ||  TSDB_UTIL.NTOV(met_ric.VALUE) || ' ';
       delim := ' ';
       endchar := TSDB_UTIL.EOL;
     END IF;
