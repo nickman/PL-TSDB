@@ -888,7 +888,7 @@ END TSDB_TRACER;
   -- Doc needed
   --====================================================================================================
   FUNCTION REFCURTOMETRICSINONLY(p IN SYS_REFCURSOR) RETURN METRIC_ARR IS
-    pout SYS_REFCURSOR := INDIRECT(p);
+    pout SYS_REFCURSOR := p; --INDIRECT(p);
     cursorNum NUMBER;
     a VARCHAR2(1000);
   BEGIN
@@ -1069,6 +1069,15 @@ begin
   DBMS_OUTPUT.PUT_LINE('ELAPSED:' || elapsed);
 end;
 
+select value(t) from table(tsdb_tracer.REFCURTOMETRICSINONLY(CURSOR(
+  SELECT M.VALUE, TSDB_UTIL.CLEAN(N.NAME) NAME, 'CLASS', TSDB_TRACER.DECODE_CLASS(N.CLASS) CLAZZ
+      FROM v$mystat M, v$statname N
+      WHERE M.STATISTIC# = N.STATISTIC#
+      AND EXISTS (
+        SELECT COLUMN_VALUE FROM TABLE(TSDB_UTIL.USERSTATKEYS())
+        WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
+      )))) t
+      
 
 
 
