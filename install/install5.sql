@@ -2,7 +2,7 @@
 --  DDL for Package TSDB_TRACER
 --------------------------------------------------------
 
-  CREATE OR REPLACE PACKAGE TSDB_TRACER authid definer AS 
+create or replace PACKAGE TSDB_TRACER authid definer AS 
   /* Type defining a map of metrics keyed by the metric key */
   TYPE XMETRIC_ARR IS TABLE OF METRIC INDEX BY VARCHAR2(360);
   /* Type defining a stack of metric arrays for handling nested delta measurements */
@@ -45,6 +45,25 @@
     M METRIC
   );
   TYPE QCUR IS REF CURSOR RETURN METRIC_REC;
+  
+  
+  -- ===================================================
+  --   NEW NEW NEW
+  -- ===================================================
+  FUNCTION METRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) RETURN METRIC_ARR;
+  PROCEDURE METRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR);
+  
+  FUNCTION CLOSEMETRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) RETURN METRIC_ARR;
+  PROCEDURE CLOSEMETRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR);
+  
+  PROCEDURE CLEARMETRICSETS;
+  PROCEDURE CLEARMETRICSETS(setName IN VARCHAR2);
+  
+  FUNCTION METRICSETS RETURN NAMEVALUE_ARR;
+  
+  
+  
+  -- ===================================================
   
   --===================================================================================================================
   --  Returns the user stats as metrics
@@ -114,7 +133,11 @@
   --====================================================================================================
   FUNCTION REFCURTOMETRICSINONLY(p IN SYS_REFCURSOR) RETURN METRIC_ARR;
   
-  
+  --====================================================================================================
+  -- Packs all the passed metric arrays into one metric array
+  --====================================================================================================
+  FUNCTION PACK(metricsArrArr IN METRIC_ARR_ARR) RETURN METRIC_ARR;
+    
   --====================================================================================================
   -- Converts the results from the passed SQL query to an array of metrics
   -- Doc needed
@@ -171,6 +194,8 @@
   PROCEDURE TRACE(metrics IN METRIC_ARR);
   -- Trace a metric
   PROCEDURE TRACE(metric IN METRIC);
+  -- Trace all metrics and return the the number of metrics traced
+  FUNCTION TRACE(metrics IN METRIC_ARR) RETURN INT;  
   -- Trace all metrics and return a count
   FUNCTION TRACEF(metrics IN METRIC_ARR) RETURN METRIC_ARR;
 
@@ -207,8 +232,7 @@ END TSDB_TRACER;
 --------------------------------------------------------
 --  DDL for Package Body TSDB_TRACER
 --------------------------------------------------------
-
-  CREATE OR REPLACE PACKAGE BODY TSDB_TRACER AS
+create or replace PACKAGE BODY TSDB_TRACER AS
 
   /* The metric stack */
   metricStack XMETRIC_ARR_STACK;
@@ -219,7 +243,51 @@ END TSDB_TRACER;
   /* A map of timer metrics keyed by the metric key */
   timers XMETRIC_ARR;
   
-    --====================================================================================================
+  -- ===================================================
+  --   NEW NEW NEW
+  -- ===================================================
+  FUNCTION METRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) RETURN METRIC_ARR IS
+  BEGIN
+    NULL;
+  END METRICSET;
+  
+  PROCEDURE METRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) IS
+  BEGIN
+    NULL;
+  END METRICSET;
+  
+  FUNCTION CLOSEMETRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) RETURN METRIC_ARR IS
+  BEGIN
+    NULL;
+  END CLOSEMETRICSET;
+  
+  
+  PROCEDURE CLOSEMETRICSET(setName IN VARCHAR2, p IN OUT SYS_REFCURSOR) IS
+  BEGIN
+    NULL;
+  END CLOSEMETRICSET;
+  
+  PROCEDURE CLEARMETRICSETS IS
+  BEGIN
+    NULL;
+  END CLEARMETRICSETS;
+  
+  PROCEDURE CLEARMETRICSETS(setName IN VARCHAR2) IS
+  BEGIN
+    NULL;
+  END CLEARMETRICSETS;
+  
+  FUNCTION METRICSETS RETURN NAMEVALUE_ARR IS
+  BEGIN
+    NULL;
+  END METRICSETS;
+  
+  
+  
+  -- ===================================================
+  
+  
+  --====================================================================================================
   -- Returns a ref cursor of persisted metrics
   --====================================================================================================
   FUNCTION METRIC_REFCUR(locked IN INT DEFAULT 0, maxrows IN INT DEFAULT 1000) RETURN SYS_REFCURSOR IS
@@ -447,14 +515,14 @@ END TSDB_TRACER;
     name VARCHAR2(40);
   BEGIN
     select 
-    decode (bitand(  1,classNum),  1,'User ',              '') ||
-    decode (bitand(  2,classNum),  2,'Redo ',              '') ||
-    decode (bitand(  4,classNum),  4,'Enqueue ',           '') ||
-    decode (bitand(  8,classNum),  8,'Cache ',             '') ||
-    decode (bitand( 16,classNum), 16,'Parallel Server ',   '') ||
-    decode (bitand( 32,classNum), 32,'OS ',                '') ||
-    decode (bitand( 64,classNum), 64,'SQL ',               '') ||
-    decode (bitand(128,classNum),128,'Debug ',             '') INTO name FROM DUAL;
+    decode (bitand(  1,classNum),  1,'User',              '') ||
+    decode (bitand(  2,classNum),  2,'Redo',              '') ||
+    decode (bitand(  4,classNum),  4,'Enqueue',           '') ||
+    decode (bitand(  8,classNum),  8,'Cache',             '') ||
+    decode (bitand( 16,classNum), 16,'Parallel Server',   '') ||
+    decode (bitand( 32,classNum), 32,'OS',                '') ||
+    decode (bitand( 64,classNum), 64,'SQL',               '') ||
+    decode (bitand(128,classNum),128,'Debug',             '') INTO name FROM DUAL;
     RETURN name;
   END DECODE_CLASS;
 
@@ -633,6 +701,14 @@ END TSDB_TRACER;
   BEGIN
     TRACE(METRIC_ARR(metric));
   END TRACE;
+  
+  -- Trace all metrics and return the the number of metrics traced
+  FUNCTION TRACE(metrics IN METRIC_ARR) RETURN INT IS    
+  BEGIN
+    TRACE(metrics);
+    RETURN metrics.COUNT;
+  END TRACE;
+  
 
   -- Trace all metrics and return the array
   FUNCTION TRACEF(metrics IN METRIC_ARR) RETURN METRIC_ARR IS
@@ -641,53 +717,126 @@ END TSDB_TRACER;
     RETURN metrics;
   END TRACEF;
   
+  --====================================================================================================
+  -- Packs all the passed metric arrays into one metric array
+  --====================================================================================================
+  FUNCTION PACK(metricsArrArr IN METRIC_ARR_ARR) RETURN METRIC_ARR IS
+    packed METRIC_ARR := METRIC_ARR();
+    idx PLS_INTEGER := 1;
+  BEGIN
+    LOGGING.log('PACKing [' || metricsArrArr.COUNT || '] METRIC Arrays');
+    FOR i IN 1..metricsArrArr.COUNT LOOP
+      FOR x IN 1..metricsArrArr(i).COUNT LOOP
+        packed.extend();
+        IF(metricsArrArr(i)(x) IS NOT NULL) THEN
+          packed(idx) := metricsArrArr(i)(x);
+          idx := idx + 1;
+        END IF;
+      END LOOP;
+      --SELECT VALUE(T) BULK COLLECT INTO packed FROM TABLE(metricsArrArr(i)) T;
+    END LOOP;
+    LOGGING.log('PACKed [' || packed.COUNT || '] METRICs');
+    RETURN packed;
+  END PACK;
+  
+  
+  
+  -- Posts the passed content to the configured HTTP endpoint
+  PROCEDURE POST(content IN CLOB) IS
+    req   UTL_HTTP.REQ;
+    resp  UTL_HTTP.RESP;    
+    postUrl VARCHAR2(1000) := 'http://' || TSDB_UTIL.CFG_TRACING_HTTP_HOST || ':' || TSDB_UTIL.CFG_TRACING_HTTP_PORT || TSDB_UTIL.CFG_TRACING_HTTP_URI;
+  BEGIN
+      req := UTL_HTTP.BEGIN_REQUEST (url=> postUrl, method => 'POST');
+      UTL_HTTP.SET_HEADER (r =>  req, name   =>  'Content-Type', value  =>  'application/json;charset=UTF-8');
+      UTL_HTTP.SET_HEADER (r =>  req, name => 'Content-Length', value => length(content));
+      UTL_HTTP.WRITE_TEXT (r =>  req, data => content);    
+      resp := UTL_HTTP.GET_RESPONSE(req);
+      UTL_HTTP.END_RESPONSE(resp);          
+      EXCEPTION WHEN OTHERS THEN
+        DECLARE
+          errm VARCHAR2(200) := SQLERRM();
+        BEGIN
+          LOGGING.error('POST ERROR: errm:' || errm);
+        END;
+        RAISE;
+  END POST;
+  
+  
   
   -- Trace all metrics
+  -- Having persistent trouble with chunked transfers,
+  -- so posts are sent in individual bodies
+  -- of <= 32767 bytes
   PROCEDURE TRACE(metrics IN METRIC_ARR) IS
     content CLOB;
     jsonText VARCHAR2(400);
     now TIMESTAMP(9) := SYSTIMESTAMP;
-    req   UTL_HTTP.REQ;
-    resp  UTL_HTTP.RESP;    
-    postUrl VARCHAR2(1000) := 'http://' || TSDB_UTIL.CFG_TRACING_HTTP_HOST || ':' || TSDB_UTIL.CFG_TRACING_HTTP_PORT || TSDB_UTIL.CFG_TRACING_HTTP_URI;
     metricCount CONSTANT INT := metrics.COUNT;
     startTime CONSTANT NUMBER := DBMS_UTILITY.GET_TIME;
+    buffer VARCHAR2(2000) := NULL;
+    contentLength PLS_INTEGER := 0;
+    jsonLength PLS_INTEGER := 0;
+    amount PLS_INTEGER := 2000;
+    offset PLS_INTEGER := 1;
+    chunked BOOLEAN := false;
+    maxSize CONSTANT PLS_INTEGER := 32765;    
+    metricsDone BOOLEAN := FALSE;
+    totalPayloadSize PLS_INTEGER := 0;
   BEGIN
     DBMS_LOB.CREATETEMPORARY(content, true, DBMS_LOB.CALL);
     DBMS_LOB.OPEN(content, DBMS_LOB.LOB_READWRITE);
     DBMS_LOB.WRITEAPPEND(content, 1, '[');      
-    FOR i IN 1..metrics.COUNT LOOP
-      IF(length(content) > 1) THEN
-        DBMS_LOB.WRITEAPPEND(content, 1, ',');      
-      END IF;
+    FOR i IN 1..metrics.COUNT LOOP      
       jsonText := metrics(i).JSONMS();
-      DBMS_LOB.WRITEAPPEND(content, length(jsonText), jsonText);      
+      jsonLength := length(jsonText);      
+      IF((contentLength + jsonLength) > maxSize) THEN
+        DBMS_LOB.WRITEAPPEND(content, 1, ']');   
+        POST(content);
+        totalPayloadSize := totalPayloadSize + jsonLength;
+        DBMS_LOB.ERASE(content, contentLength, 2); -- Delete everything except the json array opener
+        contentLength := 1;
+        metricsDone := TRUE;
+      END IF;      
+      IF(DBMS_LOB.GETLENGTH(content) > 2) THEN
+        DBMS_LOB.WRITEAPPEND(content, 1, ',');      
+        contentLength := contentLength + 1;
+      END IF;      
+      DBMS_LOB.WRITEAPPEND(content, jsonLength, jsonText);      
+      contentLength := contentLength + jsonLength;      
+      metricsDone := FALSE;
     END LOOP;
-    DBMS_LOB.WRITEAPPEND(content, 1, ']');    
-    --LOGGING.debug(content);
-    req := UTL_HTTP.BEGIN_REQUEST (url=> postUrl, method => 'POST');
-    UTL_HTTP.SET_HEADER (r      =>  req,
-                       name   =>  'Content-Type',
-                       value  =>  'application/json;charset=UTF-8');
-    UTL_HTTP.SET_HEADER (r      =>   req,
-                       name   =>   'Content-Length',
-                       value  =>   length(content));
-    UTL_HTTP.WRITE_TEXT (r      =>   req,
-                       data   =>   content);    
-    resp := UTL_HTTP.GET_RESPONSE(req);
-    UTL_HTTP.END_RESPONSE(resp);
-    LOGGING.log('Traced [' || metricCount || '] metrics in [' || ((DBMS_UTILITY.GET_TIME - startTime)*10) || '] ms.');
+    IF(metricsDone != TRUE) THEN
+      LOGGING.log('Metrics Not Done');
+        DBMS_LOB.WRITEAPPEND(content, 1, ']');   
+        POST(content);    
+        totalPayloadSize := totalPayloadSize + 1;
+    END IF;
+    DBMS_LOB.CLOSE(content);
+    DBMS_LOB.FREETEMPORARY(content);    
+    LOGGING.log('Traced [' || metricCount || '] metrics in [' || ((DBMS_UTILITY.GET_TIME - startTime)*10) || '] ms. Payload Size: [' || totalPayloadSize || '] bytes');
     EXCEPTION WHEN OTHERS THEN 
+        BEGIN
+          DBMS_LOB.CLOSE(content);
+          EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+        BEGIN
+          DBMS_LOB.FREETEMPORARY(content);
+          EXCEPTION WHEN OTHERS THEN NULL;
+        END;
         DECLARE
           errm VARCHAR2(200) := SQLERRM();
         BEGIN
           LOGGING.error('TRACE ERROR: errm:' || errm);
         END;
         RAISE;                    
-    
-    DBMS_LOB.CLOSE(content);
-    DBMS_LOB.FREETEMPORARY(content);
   END TRACE;
+  
+    -- Closes any persistent connections
+  PROCEDURE CLOSE_PERSISTENT_CONNS IS
+  BEGIN
+    UTL_HTTP.CLOSE_PERSISTENT_CONNS(host => TSDB_UTIL.CFG_TRACING_HTTP_HOST, port => TSDB_UTIL.CFG_TRACING_HTTP_PORT);
+  END CLOSE_PERSISTENT_CONNS;
   
     -- Closes any persistent connections
   PROCEDURE CLOSE_PERSISTENT_CONNS IS
@@ -888,7 +1037,7 @@ END TSDB_TRACER;
   -- Doc needed
   --====================================================================================================
   FUNCTION REFCURTOMETRICSINONLY(p IN SYS_REFCURSOR) RETURN METRIC_ARR IS
-    pout SYS_REFCURSOR := INDIRECT(p);
+    pout SYS_REFCURSOR := p;
     cursorNum NUMBER;
     a VARCHAR2(1000);
   BEGIN
@@ -1074,7 +1223,7 @@ end;
 
       
 */
-
+  
 /
 
 

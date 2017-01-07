@@ -499,3 +499,11 @@ END;
   CREATE OR REPLACE TYPE METRIC_ARR as table of metric;
 
 /
+
+--------------------------------------------------------
+--  DDL for Type METRIC_ARR_ARR
+--------------------------------------------------------
+
+  CREATE OR REPLACE TYPE METRIC_ARR_ARR as table of METRIC_ARR;
+
+/
