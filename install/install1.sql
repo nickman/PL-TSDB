@@ -293,8 +293,8 @@
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
-  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2;
-  
+  FUNCTION CLEAN(str IN VARCHAR2, repl IN CHAR DEFAULT '.') RETURN VARCHAR2 ;
+    
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
@@ -970,14 +970,16 @@ END TSDB_UTIL;
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
-  FUNCTION CLEAN(str IN VARCHAR2) RETURN VARCHAR2 IS
+  FUNCTION CLEAN(str IN VARCHAR2, repl IN CHAR DEFAULT '.') RETURN VARCHAR2 IS
     cs VARCHAR2(360);
+    replString CONSTANT VARCHAR2(2) := repl || repl;
   BEGIN
     IF(str IS NULL) THEN 
       RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was null');
     END IF;
     --cs := TRANSLATE(RTRIM(LTRIM(LOWER(str))), ' /*().+%', '__');
-    cs := TRANSLATE(TRIM(LOWER(str)), ' /*()+%', '__');
+    --cs := REPLACE(TRANSLATE(REPLACE(REPLACE(TRIM(LOWER(str)), 'i/o', 'io'), '(', ''), ' /*()+%:''', replString), '_-_', '');
+    cs := REGEXP_REPLACE(REGEXP_REPLACE(LOWER(str), '[-''/*()+%:]', ''), '\s+', repl);
     IF(cs IS NULL) THEN 
       RAISE_APPLICATION_ERROR(-20101, 'The passed varchar was empty');
     END IF;    

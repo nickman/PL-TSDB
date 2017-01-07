@@ -136,6 +136,11 @@
   FUNCTION UPDATE_DELTA_METRIC(mdepth IN INT, met_ric IN METRIC) RETURN METRIC;
   -- Updates an array of delta metrics in the metric stack entry at the specified mdepth
   PROCEDURE UPDATE_DELTA_METRICS(mdepth IN INT, metrics IN METRIC_ARR);
+
+  --====================================================================================================
+  -- Packs all the passed metric arrays into one metric array
+  --====================================================================================================
+  FUNCTION PACK(metricsArrArr IN METRIC_ARR_ARR) RETURN METRIC_ARR;  
   
 --  -- Stacks the passed metrics and starts their elapsed times
 --  FUNCTION START_ELAPSED_METRIC(mdepth IN INT, metrics IN METRIC_ARR) RETURN METRIC;
@@ -219,7 +224,7 @@ END TSDB_TRACER;
   /* A map of timer metrics keyed by the metric key */
   timers XMETRIC_ARR;
   
-    --====================================================================================================
+  --====================================================================================================
   -- Returns a ref cursor of persisted metrics
   --====================================================================================================
   FUNCTION METRIC_REFCUR(locked IN INT DEFAULT 0, maxrows IN INT DEFAULT 1000) RETURN SYS_REFCURSOR IS
@@ -447,14 +452,14 @@ END TSDB_TRACER;
     name VARCHAR2(40);
   BEGIN
     select 
-    decode (bitand(  1,classNum),  1,'User ',              '') ||
-    decode (bitand(  2,classNum),  2,'Redo ',              '') ||
-    decode (bitand(  4,classNum),  4,'Enqueue ',           '') ||
-    decode (bitand(  8,classNum),  8,'Cache ',             '') ||
-    decode (bitand( 16,classNum), 16,'Parallel Server ',   '') ||
-    decode (bitand( 32,classNum), 32,'OS ',                '') ||
-    decode (bitand( 64,classNum), 64,'SQL ',               '') ||
-    decode (bitand(128,classNum),128,'Debug ',             '') INTO name FROM DUAL;
+    decode (bitand(  1,classNum),  1,'User',              '') ||
+    decode (bitand(  2,classNum),  2,'Redo',              '') ||
+    decode (bitand(  4,classNum),  4,'Enqueue',           '') ||
+    decode (bitand(  8,classNum),  8,'Cache',             '') ||
+    decode (bitand( 16,classNum), 16,'Parallel Server',   '') ||
+    decode (bitand( 32,classNum), 32,'OS',                '') ||
+    decode (bitand( 64,classNum), 64,'SQL',               '') ||
+    decode (bitand(128,classNum),128,'Debug',             '') INTO name FROM DUAL;
     RETURN name;
   END DECODE_CLASS;
 
@@ -640,6 +645,26 @@ END TSDB_TRACER;
     TRACE(metrics);
     RETURN metrics;
   END TRACEF;
+
+  --====================================================================================================
+  -- Packs all the passed metric arrays into one metric array
+  --====================================================================================================
+  FUNCTION PACK(metricsArrArr IN METRIC_ARR_ARR) RETURN METRIC_ARR IS
+    packed METRIC_ARR := METRIC_ARR();
+    idx PLS_INTEGER := 1;
+  BEGIN
+    FOR i IN 1..metricsArrArr.COUNT LOOP
+      FOR x IN 1..metricsArrArr(i).COUNT LOOP
+        packed.extend();
+        IF(metricsArrArr(i)(x) IS NOT NULL) THEN
+          packed(idx) := metricsArrArr(i)(x);
+          idx := idx + 1;
+        END IF;
+      END LOOP;
+    END LOOP;
+    RETURN packed;
+  END PACK;
+
   
   
   -- Trace all metrics
@@ -652,6 +677,11 @@ END TSDB_TRACER;
     postUrl VARCHAR2(1000) := 'http://' || TSDB_UTIL.CFG_TRACING_HTTP_HOST || ':' || TSDB_UTIL.CFG_TRACING_HTTP_PORT || TSDB_UTIL.CFG_TRACING_HTTP_URI;
     metricCount CONSTANT INT := metrics.COUNT;
     startTime CONSTANT NUMBER := DBMS_UTILITY.GET_TIME;
+    buffer VARCHAR2(2000) := NULL;
+    contentLength PLS_INTEGER := -1;
+    amount PLS_INTEGER := 2000;
+    offset PLS_INTEGER := 1;
+    chunked BOOLEAN := false;
   BEGIN
     DBMS_LOB.CREATETEMPORARY(content, true, DBMS_LOB.CALL);
     DBMS_LOB.OPEN(content, DBMS_LOB.LOB_READWRITE);
@@ -663,30 +693,50 @@ END TSDB_TRACER;
       jsonText := metrics(i).JSONMS();
       DBMS_LOB.WRITEAPPEND(content, length(jsonText), jsonText);      
     END LOOP;
-    DBMS_LOB.WRITEAPPEND(content, 1, ']');    
-    --LOGGING.debug(content);
+    DBMS_LOB.WRITEAPPEND(content, 1, ']');   
+    contentLength := DBMS_LOB.GETLENGTH(content);
+    IF(contentLength=0) THEN RETURN; END IF;
+    chunked := contentLength > 32767;
     req := UTL_HTTP.BEGIN_REQUEST (url=> postUrl, method => 'POST');
     UTL_HTTP.SET_HEADER (r      =>  req,
                        name   =>  'Content-Type',
                        value  =>  'application/json;charset=UTF-8');
-    UTL_HTTP.SET_HEADER (r      =>   req,
-                       name   =>   'Content-Length',
-                       value  =>   length(content));
-    UTL_HTTP.WRITE_TEXT (r      =>   req,
-                       data   =>   content);    
+    IF(chunked) THEN
+      UTL_HTTP.SET_HEADER (r      =>   req,
+                         name   =>   'Transfer-Encoding',
+                         value  =>   'chunked');
+      WHILE(offset < contentLength) LOOP
+        DBMS_LOB.read(content, amount, offset, buffer);
+        UTL_HTTP.WRITE_TEXT(req, buffer);
+        offset := offset + amount;
+      END LOOP;
+    ELSE
+      UTL_HTTP.SET_HEADER (r      =>   req,
+                         name   =>   'Content-Length',
+                         value  =>   length(content));
+      UTL_HTTP.WRITE_TEXT (r      =>   req,
+                         data   =>   content);    
+    END IF;
     resp := UTL_HTTP.GET_RESPONSE(req);
     UTL_HTTP.END_RESPONSE(resp);
-    LOGGING.log('Traced [' || metricCount || '] metrics in [' || ((DBMS_UTILITY.GET_TIME - startTime)*10) || '] ms.');
+    DBMS_LOB.CLOSE(content);
+    DBMS_LOB.FREETEMPORARY(content);    
+    LOGGING.log('Traced [' || metricCount || '] metrics in [' || ((DBMS_UTILITY.GET_TIME - startTime)*10) || '] ms. Payload Size: [' || contentLength || '] bytes');
     EXCEPTION WHEN OTHERS THEN 
+        BEGIN
+          DBMS_LOB.CLOSE(content);
+          EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+        BEGIN
+          DBMS_LOB.FREETEMPORARY(content);
+          EXCEPTION WHEN OTHERS THEN NULL;
+        END;
         DECLARE
           errm VARCHAR2(200) := SQLERRM();
         BEGIN
           LOGGING.error('TRACE ERROR: errm:' || errm);
         END;
         RAISE;                    
-    
-    DBMS_LOB.CLOSE(content);
-    DBMS_LOB.FREETEMPORARY(content);
   END TRACE;
   
     -- Closes any persistent connections
@@ -1078,7 +1128,11 @@ select value(t) from table(tsdb_tracer.REFCURTOMETRICSINONLY(CURSOR(
         WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
       )))) t
       
-
+begin
+  update TSDB_CONFIG set v = '172.16.11.1' where k = 'tracing.http.host';
+  commit;
+  TSDB_UTIL.LOAD_CONFIG;
+end;
 
 
       
@@ -1087,3 +1141,14 @@ select value(t) from table(tsdb_tracer.REFCURTOMETRICSINONLY(CURSOR(
 /
 
 
+CREATE PUBLIC SYNONYM VARCHAR2_ARR FOR PLTSDB.VARCHAR2_ARR;
+CREATE PUBLIC SYNONYM INT_ARR FOR PLTSDB.INT_ARR;
+CREATE PUBLIC SYNONYM TSDB_UTIL FOR PLTSDB.TSDB_UTIL;
+CREATE PUBLIC SYNONYM LOGGING FOR PLTSDB.LOGGING;
+CREATE PUBLIC SYNONYM TAGPAIR FOR PLTSDB.TAGPAIR;
+CREATE PUBLIC SYNONYM TAGPAIR_ARR FOR PLTSDB.TAGPAIR_ARR;
+CREATE PUBLIC SYNONYM METRIC FOR PLTSDB.METRIC;
+CREATE PUBLIC SYNONYM METRIC_ARR FOR PLTSDB.METRIC_ARR;
+CREATE PUBLIC SYNONYM METRIC_EXT FOR PLTSDB.METRIC_EXT;
+CREATE PUBLIC SYNONYM METRIC_EXT_ARR FOR PLTSDB.METRIC_EXT_ARR;
+CREATE PUBLIC SYNONYM TSDB_TRACER FOR PLTSDB.TSDB_TRACER;
