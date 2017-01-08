@@ -966,17 +966,46 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     RETURN 'N';
   END BOOL_TO_CHAR;
 
-  PROCEDURE LOGDESCTAB(d IN DBMS_SQL.DESC_REC3) IS
+  PROCEDURE LOGDESCTAB(col IN PLS_INTEGER, d IN DBMS_SQL.DESC_TAB3) IS
+    nullable CHAR(1);
   BEGIN
-    LOGGING.debug('[dtab] type:[' || d.col_type || '], name:[' || d.col_name || ']');
+    IF(d(col).col_null_ok) THEN 
+      nullable := 'Y';
+    ELSE
+      nullable := 'N';
+    END IF;
+    LOGGING.debug('COL #' || col || ' - ' || 'coltype:[' || d(col).col_type || '],' || 'colmaxlen:[' || d(col).col_max_len || '],' || 'colname:[' || d(col).col_name || '],' || 'colnamelen:[' || d(col).col_name_len || '],' || 'colschemaname:[' || d(col).col_schema_name || '],' || 'colschemanamelen:[' || d(col).col_schema_name_len || '],' || 'colprecision:[' || d(col).col_precision || '],' || 'colscale:[' || d(col).col_scale || '],' || 'colcharsetid:[' || d(col).col_charsetid || '],' || 'colcharsetform:[' || d(col).col_charsetform || '],' || 'colnullok:[' || nullable || '],' || 'coltypename:[' || d(col).col_type_name || '],' || 'coltypenamelen:[' || d(col).col_type_name_len || ']');
   END LOGDESCTAB;
+  
+  
+  FUNCTION IS_CHAR_TYPE(colType IN PLS_INTEGER) RETURN BOOLEAN IS
+  BEGIN
+    RETURN (
+      colType = DBMS_TYPES.TYPECODE_VARCHAR2 
+      OR colType = DBMS_TYPES.TYPECODE_NVARCHAR2 
+      OR colType = DBMS_TYPES.TYPECODE_VARCHAR 
+      OR colType = DBMS_TYPES.TYPECODE_CHAR 
+      OR colType = DBMS_TYPES.TYPECODE_NCHAR);    
+  END IS_CHAR_TYPE;
+  
+  FUNCTION IS_NUM_OR_DATE(colType IN PLS_INTEGER) RETURN BOOLEAN IS
+  BEGIN
+    RETURN (
+      colType = DBMS_TYPES.TYPECODE_TIMESTAMP
+      OR colType = DBMS_TYPES.TYPECODE_TIMESTAMP_TZ
+      OR colType = DBMS_TYPES.TYPECODE_TIMESTAMP_LTZ
+      OR colType = DBMS_TYPES.TYPECODE_DATE
+      OR colType = DBMS_TYPES.TYPECODE_NUMBER
+    );
+  END IS_NUM_OR_DATE;
+  
   
   
   --====================================================================================================
   -- Converts the results from the passed opened and parsed cursor number to an array of metrics.
   -- The cursor is closed on completion.
   -- Doc needed
-  -- SPEC:  [TIMESTAMP # OR DATE OR TIMESTAMP],METRIC_NAME_PREFIX (or FORMAT ?), [TAGKEY1, TAGVALUE1,TAGKEY1n,TAGVALUEn], VALUE1, [...VALUEn]
+  -- SPEC:  [TIMESTAMP # OR DATE OR TIMESTAMP],METRIC_NAME_FORMAT, [TAGKEY1FMT, TAGVALUE1FMT,TAGKEY1nFMT,TAGVALUEnFMT], VALUE1, [...VALUEn]
   --====================================================================================================
   FUNCTION CURSORINTTOMETRICS(cursorNum IN OUT NOCOPY NUMBER) RETURN METRIC_ARR IS
     cntr PLS_INTEGER := 0;
@@ -1000,18 +1029,50 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     tsTimestampWTimeZone TIMESTAMP WITH TIME ZONE;
     tsDate DATE;
     tsNumber NUMBER;
+    typeCodes INT_ARR;
+    metricNameFormat VARCHAR2(360);
+    
   BEGIN
-    DBMS_SQL.DESCRIBE_COLUMNS3(cursorNum, colcnt, desctab);
+    DBMS_SQL.DESCRIBE_COLUMNS3(cursorNum, colcnt, desctab);    
     IF(colcnt < 2) THEN
-      LOGDESCTAB(desctab(1));
+      LOGDESCTAB(1, desctab);
       RETURN metrics;
     END IF;
-    hasTs := MOD(colcnt, 2) != 0;
-    IF(hasTs) THEN
-      tagCount := (colcnt - 3) / 2;
+    typeCodes.extend(colcnt);
+    FOR i IN 1..colcnt LOOP
+      typeCodes(i) := desctab(i).col_type;
+    END LOOP;
+    -- Find the index of the first +1 col that is a number (the index of the first value)
+    
+    -- Determine if the first column is NOT a String, meaning a timestamp is provided
+    IF(IS_CHAR_TYPE(typeCodes(1))) THEN
+      hasTs := FALSE;
     ELSE
-      tagCount := (colcnt - 2) / 2;
+      hasTs := TRUE;
     END IF;
+    
+    
+    
+    hasTs := IS_CHAR_TYPE(typeCodes(1)) != TRUE;
+    -- If hasTs is true, then column(1) coltype must be a timestamp/date/number (i.e. a datatype from which a timestamp can be derived)
+    IF(IS_NUM_OR_DATE(typeCodes(1)) = FALSE) THEN
+      RAISE invalid_metrics_cursor;
+    END IF;
+    --  find the first index of the <values> in the query
+    FOR i IN 1..typeCodes.COUNT LOOP
+      NULL;
+      
+    END LOOP;
+    
+    
+    
+    
+--    
+--    
+--      tagCount := (colcnt - 3) / 2;
+--    ELSE
+--      tagCount := (colcnt - 2) / 2;
+--    END IF;
     DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, metValue); 
     DBMS_SQL.DEFINE_COLUMN(cursorNum, 2, metName, 100); 
     IF(hasTs) THEN
@@ -1101,6 +1162,128 @@ create or replace PACKAGE BODY TSDB_TRACER AS
       
   END CURSORINTTOMETRICS;
 
+--  FUNCTION CURSORINTTOMETRICS(cursorNum IN OUT NOCOPY NUMBER) RETURN METRIC_ARR IS
+--    cntr PLS_INTEGER := 0;
+--    rows_processed INTEGER;    
+--    desctab  DBMS_SQL.DESC_TAB3;
+--    colcnt   NUMBER;   
+--    colnum INT;
+--    hasTs BOOLEAN;
+--    tsType PLS_INTEGER := NULL;
+--    tsTypeName VARCHAR2(200);
+--    tId PLS_INTEGER := 3;
+--    tagCount PLS_INTEGER;
+--    met METRIC := NULL;
+--    metrics METRIC_ARR := METRIC_ARR();
+--    metName VARCHAR2(100);
+--    metValue NUMBER;
+--    tagK VARCHAR2(100);
+--    tagV VARCHAR2(100);
+--    rowsFetched PLS_INTEGER := 0;    
+--    tsTimestamp TIMESTAMP;
+--    tsTimestampWTimeZone TIMESTAMP WITH TIME ZONE;
+--    tsDate DATE;
+--    tsNumber NUMBER;
+--  BEGIN
+--    DBMS_SQL.DESCRIBE_COLUMNS3(cursorNum, colcnt, desctab);
+--    IF(colcnt < 2) THEN
+--      LOGDESCTAB(desctab(1));
+--      RETURN metrics;
+--    END IF;
+--    hasTs := MOD(colcnt, 2) != 0;
+--    IF(hasTs) THEN
+--      tagCount := (colcnt - 3) / 2;
+--    ELSE
+--      tagCount := (colcnt - 2) / 2;
+--    END IF;
+--    DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, metValue); 
+--    DBMS_SQL.DEFINE_COLUMN(cursorNum, 2, metName, 100); 
+--    IF(hasTs) THEN
+--      tsType := desctab(colcnt).col_type;
+--      tsTypeName := desctab(colcnt).col_type_name;
+--      LOGGING.debug('TSTYPE: [' || tsType || '], TS NAME: [' || tsTypeName || '], COLCNT: [' || colcnt || ']');
+--      CASE tsType
+--        WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
+--          LOGGING.debug('DEFINE TIMESTAMP');
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt,  tsTimestamp);
+--        WHEN 181 THEN
+--          LOGGING.debug('DEFINE TIMESTAMP WITH TZ');
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsTimestampWTimeZone);          
+--        WHEN DBMS_TYPES.TYPECODE_DATE THEN
+--          LOGGING.debug('DEFINE DATE');
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsDate);
+--        WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
+--          LOGGING.debug('DEFINE NUMBER');
+--          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsNumber);
+--        ELSE
+--          RAISE unsupported_timestamp_type;
+--      END CASE;
+--    END IF;
+--    LOGGING.debug('CURSORINTTOMETRICS: Tag Pairs: ' || tagCount || ', TS: ' || BOOL_TO_CHAR(hasTs));
+--    
+--    FOR i IN 1..tagCount LOOP
+--      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, DBMS_TYPES.TYPECODE_VARCHAR2, 100);
+--      LOGGING.debug('Bound Tag Key [' || i || '] at position [' || tId || ']');
+--      tId := tId + 1;
+--      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, DBMS_TYPES.TYPECODE_VARCHAR2, 100);
+--      --DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, tagV, 100);
+--      LOGGING.debug('Bound Tag Value [' || i || '] at position [' || tId || ']');
+--      tId := tId + 1;
+--    END LOOP;
+--    LOGGING.debug('CURSORINTTOMETRICS: Tags Bound');
+--    tId := 3;
+--    colnum := desctab.first;
+--    LOGGING.debug('CURSORINTTOMETRICS: Executing...');
+--    --rowsFetched := DBMS_SQL.EXECUTE(cursorNum);
+--    LOGGING.debug('CURSORINTTOMETRICS: Executed: ' || rowsFetched);
+--    LOOP      
+--      rowsFetched := DBMS_SQL.FETCH_ROWS(cursorNum);
+--      EXIT WHEN rowsFetched = 0;
+--      cntr := cntr + 1;        
+--      DBMS_SQL.COLUMN_VALUE(cursorNum, 1, metValue);        
+--      DBMS_SQL.COLUMN_VALUE(cursorNum, 2, metName);
+--      met := METRIC(metName).HOSTAPPTAGS().VAL(metValue);
+--      FOR i IN 1..tagCount LOOP
+--        DBMS_SQL.COLUMN_VALUE(cursorNum, tId, tagK);
+--        tId := tId + 1;
+--        DBMS_SQL.COLUMN_VALUE(cursorNum, tId, tagV);
+--        tId := tId + 1;
+--        met := met.PUSHTAG(tagK, tagV);
+--      END LOOP;
+--      IF(hasTs) THEN
+--        CASE tsType
+--          WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
+--            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestamp);
+--            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestamp));
+--          WHEN 181 THEN
+--            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestampWTimeZone);
+--            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestampWTimeZone));            
+--          WHEN DBMS_TYPES.TYPECODE_DATE THEN
+--            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsDate);
+--            met := met.ts(TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, TSDB_UTIL.DATETOTIMESTAMP(tsDate)));
+--          WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
+--            DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsNumber);
+--            met := met.ts(tsNumber);
+--          END CASE;
+--      END IF;
+--      tId := 3;
+--      metrics.EXTEND();
+--      metrics(cntr) := met;
+--      --LOGGING.tcplog(met.JSONMS());
+--    END LOOP;
+--    DBMS_SQL.CLOSE_CURSOR(cursorNum);
+--    RETURN metrics;
+--    EXCEPTION WHEN OTHERS THEN       
+--      DECLARE
+--        errm VARCHAR2(200) := SQLERRM();
+--      BEGIN
+--        LOGGING.error('CURSORINTTOMETRICS ERROR: errm:' || errm);
+--        RAISE;                    
+--      END;
+--      
+--      --NULL;
+--      
+--  END CURSORINTTOMETRICS;
 
   
   
@@ -1219,6 +1402,12 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     UTL_HTTP.SET_PERSISTENT_CONN_SUPPORT(TRUE, 3);    
 END TSDB_TRACER;
 
+
+
+
+
+      
+*/
 
 
   
