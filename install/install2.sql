@@ -265,3 +265,14 @@ END LOGGING;
 END LOGGING;
 
 /
+
+
+--------------------------------------------------------
+--  DDL for NAMEVALUE types
+--------------------------------------------------------
+
+CREATE OR REPLACE TYPE NAMEVALUE AS OBJECT (
+  NAME VARCHAR2(360),
+  VALUE NUMBER
+);
+CREATE OR REPLACE TYPE NAMEVALUE_ARR AS TABLE OF NAMEVALUE;

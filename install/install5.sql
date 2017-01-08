@@ -1,7 +1,6 @@
 --------------------------------------------------------
 --  DDL for Package TSDB_TRACER
 --------------------------------------------------------
-
 create or replace PACKAGE TSDB_TRACER authid definer AS 
   /* Type defining a map of metrics keyed by the metric key */
   TYPE XMETRIC_ARR IS TABLE OF METRIC INDEX BY VARCHAR2(360);
@@ -38,6 +37,16 @@ create or replace PACKAGE TSDB_TRACER authid definer AS
     -- EOL Char
   EOL VARCHAR2(2) := '
 ';
+
+  --==================================================================================
+  -- DBMS_APPLICATION_INFO Metric Tag Keys
+  --==================================================================================
+  /** The DBMS_APPLICATION_INFO.CLIENT_INFO Metric Tag Key */
+  DAI_CLIENT_TAG_KEY CONSTANT VARCHAR2(5) := 'cinfo';
+  /** The DBMS_APPLICATION_INFO.MODULE Metric Tag Key */
+  DAI_MODULE_TAG_KEY CONSTANT VARCHAR2(6) := 'module';
+  /** The DBMS_APPLICATION_INFO.ACTION Metric Tag Key */
+  DAI_ACTION_TAG_KEY CONSTANT VARCHAR2(6) := 'action';
 
   TYPE METRIC_REC IS RECORD (
     METRIC_ID NUMBER,
@@ -219,6 +228,23 @@ create or replace PACKAGE TSDB_TRACER authid definer AS
   --====================================================================================================
   PROCEDURE SAVE_METRICS(metrics IN METRIC_ARR);
   
+  /**
+   * Adds DBMS_APPLICATION_INFO tags to the passed metric if the tag values are not null
+   * @param m The metric to add the tags to
+   * @param dotrepl An optional character to replace '.' in the tag values. Defaults to ''   
+   * @return the tagged metric
+   */
+  FUNCTION APPINFOTAGS(m IN METRIC, dotrepl IN CHAR DEFAULT '') RETURN METRIC;
+  
+  /**
+   * Adds DBMS_APPLICATION_INFO tags to the passed metrics if the tag values are not null
+   * @param m The metrics to add the tags to
+   * @param dotrepl An optional character to replace '.' in the tag values. Defaults to ''
+   * @return the tagged metrics
+   */
+  FUNCTION APPINFOTAGS(m IN METRIC_ARR, dotrepl IN CHAR DEFAULT '') RETURN METRIC_ARR;
+  
+  
   -- *******************************************************
   --    Get current XID function
   -- *******************************************************
@@ -232,6 +258,7 @@ END TSDB_TRACER;
 --------------------------------------------------------
 --  DDL for Package Body TSDB_TRACER
 --------------------------------------------------------
+
 create or replace PACKAGE BODY TSDB_TRACER AS
 
   /* The metric stack */
@@ -739,6 +766,74 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     RETURN packed;
   END PACK;
   
+  /**
+   * Adds DBMS_APPLICATION_INFO tags to the passed metric if the tag values are not null
+   * @param m The metric to add the tags to
+   * @param dotrepl An optional character to replace '.' in the tag values. Defaults to ''   
+   * @return the tagged metric
+   */
+  FUNCTION APPINFOTAGS(m IN METRIC, dotrepl IN CHAR DEFAULT '') RETURN METRIC IS
+    c VARCHAR2(64);
+    module VARCHAR2(48);
+    action VARCHAR2(32);
+    mx METRIC := m;
+  BEGIN
+    IF(module IS NOT NULL) THEN module := REPLACE(TSDB_UTIL.CLEAN(module), '.', dotrepl); END IF;
+    IF(action IS NOT NULL) THEN action := REPLACE(TSDB_UTIL.CLEAN(action), '.', dotrepl); END IF;  
+    DBMS_APPLICATION_INFO.READ_CLIENT_INFO(c);
+    DBMS_APPLICATION_INFO.READ_MODULE(module, action);
+    IF(c IS NOT NULL) THEN
+      mx := mx.pushTag(DAI_CLIENT_TAG_KEY,c);
+    END IF;
+    IF(module IS NOT NULL) THEN
+      mx := mx.pushTag(DAI_MODULE_TAG_KEY,module);
+    END IF;
+    IF(action IS NOT NULL) THEN
+      mx := mx.pushTag(DAI_ACTION_TAG_KEY,action);
+    END IF;    
+    RETURN mx;
+  END APPINFOTAGS;
+  
+  /**
+   * Adds DBMS_APPLICATION_INFO tags to the passed metrics if the tag values are not null
+   * @param m The metrics to add the tags to
+   * @param dotrepl An optional character to replace '.' in the tag values. Defaults to ''   
+   * @return the tagged metrics
+   */
+  FUNCTION APPINFOTAGS(m IN METRIC_ARR, dotrepl IN CHAR DEFAULT '') RETURN METRIC_ARR IS
+    c VARCHAR2(64);
+    module VARCHAR2(48);
+    action VARCHAR2(32);
+    mx METRIC_ARR := METRIC_ARR();
+  BEGIN
+    DBMS_APPLICATION_INFO.READ_CLIENT_INFO(c);
+    DBMS_APPLICATION_INFO.READ_MODULE(module, action);
+    IF(c IS NOT NULL) THEN c := TSDB_UTIL.CLEAN(c); END IF;
+    IF(module IS NOT NULL) THEN module := REPLACE(TSDB_UTIL.CLEAN(module), '.', dotrepl); END IF;
+    IF(action IS NOT NULL) THEN action := REPLACE(TSDB_UTIL.CLEAN(action), '.', dotrepl); END IF;
+    mx.extend(m.COUNT);
+    FOR i in 1..m.COUNT LOOP
+      IF(c IS NOT NULL) THEN
+        mx(i) := m(i).pushTag(DAI_CLIENT_TAG_KEY,c);
+      END IF;
+      IF(module IS NOT NULL) THEN
+        mx(i) := m(i).pushTag(DAI_MODULE_TAG_KEY,module);
+      END IF;
+      IF(action IS NOT NULL) THEN
+        mx(i) := m(i).pushTag(DAI_ACTION_TAG_KEY,action);
+      END IF;        
+    END LOOP;
+    RETURN mx;
+  END APPINFOTAGS;
+  
+  
+  
+--  /** The DBMS_APPLICATION_INFO.CLIENT_INFO Metric Tag Key */
+--  DAI_CLIENT_TAG_KEY CONSTANT VARCHAR2(5) := 'cinfo';
+--  /** The DBMS_APPLICATION_INFO.MODULE Metric Tag Key */
+--  DAI_MODULE_TAG_KEY CONSTANT VARCHAR2(6) := 'module';
+--  /** The DBMS_APPLICATION_INFO.ACTION Metric Tag Key */
+--  DAI_ACTION_TAG_KEY CONSTANT VARCHAR2(6) := 'action';
   
   
   -- Posts the passed content to the configured HTTP endpoint
@@ -782,33 +877,43 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     chunked BOOLEAN := false;
     maxSize CONSTANT PLS_INTEGER := 32765;    
     metricsDone BOOLEAN := FALSE;
-    totalPayloadSize PLS_INTEGER := 0;
+    totalPayloadSize PLS_INTEGER := 1;
   BEGIN
+    --LOGGING.log('TRACING [' || metrics.COUNT || '] metrics');
     DBMS_LOB.CREATETEMPORARY(content, true, DBMS_LOB.CALL);
     DBMS_LOB.OPEN(content, DBMS_LOB.LOB_READWRITE);
     DBMS_LOB.WRITEAPPEND(content, 1, '[');      
     FOR i IN 1..metrics.COUNT LOOP      
       jsonText := metrics(i).JSONMS();
       jsonLength := length(jsonText);      
+      --LOGGING.log('Metric #' || i || ':' || jsonLength);
       IF((contentLength + jsonLength) > maxSize) THEN
         DBMS_LOB.WRITEAPPEND(content, 1, ']');   
+        totalPayloadSize := totalPayloadSize + 1;
+        --LOGGING.log('Posting [' || DBMS_LOB.GETLENGTH(content) || '] bytes');
         POST(content);
-        totalPayloadSize := totalPayloadSize + jsonLength;
-        DBMS_LOB.ERASE(content, contentLength, 2); -- Delete everything except the json array opener
+        --LOGGING.log('Reseting Content Buffer [' || DBMS_LOB.GETLENGTH(content) || '] from 2 to [' || contentLength || ']');
+        DBMS_LOB.TRIM(content, 1); -- Delete everything except the json array opener
+        --LOGGING.log('Reset Content Buffer <' || TO_CHAR(content) || '>, Total So Far: [' || totalPayloadSize || ']');
         contentLength := 1;
         metricsDone := TRUE;
       END IF;      
       IF(DBMS_LOB.GETLENGTH(content) > 2) THEN
         DBMS_LOB.WRITEAPPEND(content, 1, ',');      
         contentLength := contentLength + 1;
+        totalPayloadSize := totalPayloadSize + 1;
+        --LOGGING.log('Appended Com');
       END IF;      
       DBMS_LOB.WRITEAPPEND(content, jsonLength, jsonText);      
+      --LOGGING.log('Appended [' || jsonLength || '] for total [' || DBMS_LOB.GETLENGTH(content) || '] bytes');
       contentLength := contentLength + jsonLength;      
+      totalPayloadSize := totalPayloadSize + jsonLength;
       metricsDone := FALSE;
     END LOOP;
     IF(metricsDone != TRUE) THEN
-      LOGGING.log('Metrics Not Done');
+      --LOGGING.log('Metrics Not Done');
         DBMS_LOB.WRITEAPPEND(content, 1, ']');   
+        --LOGGING.log('Final Posting [' || DBMS_LOB.GETLENGTH(content) || '] bytes');
         POST(content);    
         totalPayloadSize := totalPayloadSize + 1;
     END IF;
@@ -831,12 +936,6 @@ create or replace PACKAGE BODY TSDB_TRACER AS
         END;
         RAISE;                    
   END TRACE;
-  
-    -- Closes any persistent connections
-  PROCEDURE CLOSE_PERSISTENT_CONNS IS
-  BEGIN
-    UTL_HTTP.CLOSE_PERSISTENT_CONNS(host => TSDB_UTIL.CFG_TRACING_HTTP_HOST, port => TSDB_UTIL.CFG_TRACING_HTTP_PORT);
-  END CLOSE_PERSISTENT_CONNS;
   
     -- Closes any persistent connections
   PROCEDURE CLOSE_PERSISTENT_CONNS IS
@@ -877,6 +976,7 @@ create or replace PACKAGE BODY TSDB_TRACER AS
   -- Converts the results from the passed opened and parsed cursor number to an array of metrics.
   -- The cursor is closed on completion.
   -- Doc needed
+  -- SPEC:  [TIMESTAMP # OR DATE OR TIMESTAMP],METRIC_NAME_PREFIX (or FORMAT ?), [TAGKEY1, TAGVALUE1,TAGKEY1n,TAGVALUEn], VALUE1, [...VALUEn]
   --====================================================================================================
   FUNCTION CURSORINTTOMETRICS(cursorNum IN OUT NOCOPY NUMBER) RETURN METRIC_ARR IS
     cntr PLS_INTEGER := 0;
@@ -1121,109 +1221,19 @@ END TSDB_TRACER;
 
 
 
-/*
-select * from v$sessmetric;
-select * from v$session_event;
-select * from v$session_wait;
-select * from v$sesstat;
-select * from v$sysmetric;
-select * from v$system_event;
-select * from v$buffer_pool_statistics;
-select * from v$buffer_pool;
-select * from v$datafile;
-select * from v$db_object_cache;
-select * from v$enqueue_stat;
-select * from v$eventmetric;
-select * from v$event_name;
-select * from v$filemetric;
-select * from v$filestat;
-select * from v$latch;
-select * from v$object_usage;
-select * from v$open_cursor;
-select * from v$pgastat;
-select * from v$process;
-select * from v$rollstat;
-select * from v$sga;
-select * from v$sgastat;
-select * from v$sort_usage;
-select * from v$sqlarea;
-select * from v$sql_cursor;
-select * from v$sysstat;
-select * from v$waitstat;
-*/
-
-/*
-select value(t) from table(tsdb_tracer.sqltometrics(
-  q'#      SELECT M.VALUE, TSDB_UTIL.CLEAN(N.NAME) NAME, 'CLASS', TSDB_TRACER.DECODE_CLASS(N.CLASS) CLAZZ
-      FROM v$mystat M, v$statname N
-      WHERE M.STATISTIC# = N.STATISTIC#
-      AND EXISTS (
-        SELECT COLUMN_VALUE FROM TABLE(TSDB_UTIL.USERSTATKEYS())
-        WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
-      )#')) t;
-      
-      
-declare
-  tags TAGPAIR_ARR := TAGPAIR_ARR(TAGPAIR('aaa', 'zzz'), TAGPAIR('bbb', 'yyy'), TAGPAIR('ccc', 'xxx'));
-  cnt INT := -1;
-begin
-  SELECT COUNT(*) INTO cnt FROM TABLE(tags) T WHERE K = 'aaa';
-  DBMS_OUTPUT.PUT_LINE('COUNT of aaa:' || cnt);
-  SELECT R INTO cnt FROM (SELECT ROWNUM R, T.K KEY FROM TABLE(tags) T) V WHERE V.KEY = 'bbb';
-  DBMS_OUTPUT.PUT_LINE('OFFSET of bbb:' || cnt);
-  INSERT INTO TABLE(tags) VALUES('eee', 'www');
-end;
-
-
---select * from table(tsdb_tracer.sqltometrics(
---  q'#      SELECT M.VALUE, TSDB_UTIL.CLEAN(N.NAME) NAME, 'CLASS', TSDB_TRACER.DECODE_CLASS(N.CLASS) CLAZZ, 'FOO', 'BAR', SYSDATE - 1000
---      FROM v$mystat M, v$statname N
---      WHERE M.STATISTIC# = N.STATISTIC#
---      AND EXISTS (
---        SELECT COLUMN_VALUE FROM TABLE(TSDB_UTIL.USERSTATKEYS())
---        WHERE COLUMN_VALUE = TSDB_UTIL.CLEAN(N.NAME)
---      )#')) t;
-
-begin TSDB_TRACER.CLEARTIMERS; END;
-
-select TSDB_TRACER.STARTTIMERMETRIC(METRIC.PARSEMETRIC('sys.cpu:xhost=BBB'))
-  .SLEEP(5)
-  .CLOSE().JSONMS()
-  from dual;
-  
-select TSDB_TRACER.STOPTIMER('sys.cpu:host=aaa,host=rv-wk-dmon-03,app=orcl,user=pltsdb').JSONMS() from dual;
-
--- 22-DEC-16 04.51.24.491343 PM], st: [22-DEC-16 04.51.19.476673000 PM]
-select to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM') from dual
-
-select to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM')  - to_timestamp('22-DEC-16 04.51.19.476673000 PM', 'DD-MM-RR HH.MI.SS.FF AM')
-from dual
-
-declare
-  fromtime TIMESTAMP := to_timestamp('22-DEC-16 04.51.19.476673000 PM', 'DD-MM-RR HH.MI.SS.FF AM');
-  totime TIMESTAMP := to_timestamp('22-DEC-16 04.51.24.491343 PM', 'DD-MM-RR HH.MI.SS.FF AM');
-  delta CONSTANT INTERVAL DAY (9) TO SECOND  := totime - fromtime;
-  elapsed NUMBER;
-begin
-  DBMS_OUTPUT.PUT_LINE('INTERVAL:' || delta);
-  elapsed := TSDB_UTIL.ELAPSEDMS(fromtime, totime);
---  elapsed := ROUND(
---      (
---      (extract(day from delta)*24*60*60) + 
---      (extract(hour from delta)*60*60) + 
---      (extract(minute from delta)*60) + 
---      extract(second from delta)
---      ) * 1000
---    ,0);  
-  DBMS_OUTPUT.PUT_LINE('ELAPSED:' || elapsed);
-end;
-
-
-
-
-      
-*/
   
 /
 
 
+CREATE PUBLIC SYNONYM VARCHAR2_ARR FOR PLTSDB.VARCHAR2_ARR;
+CREATE PUBLIC SYNONYM INT_ARR FOR PLTSDB.INT_ARR;
+CREATE PUBLIC SYNONYM TSDB_UTIL FOR PLTSDB.TSDB_UTIL;
+CREATE PUBLIC SYNONYM LOGGING FOR PLTSDB.LOGGING;
+CREATE PUBLIC SYNONYM TAGPAIR FOR PLTSDB.TAGPAIR;
+CREATE PUBLIC SYNONYM TAGPAIR_ARR FOR PLTSDB.TAGPAIR_ARR;
+CREATE PUBLIC SYNONYM METRIC FOR PLTSDB.METRIC;
+CREATE PUBLIC SYNONYM METRIC_ARR FOR PLTSDB.METRIC_ARR;
+CREATE PUBLIC SYNONYM METRIC_ARR_ARR FOR PLTSDB.METRIC_ARR_ARR;
+CREATE PUBLIC SYNONYM METRIC_EXT FOR PLTSDB.METRIC_EXT;
+CREATE PUBLIC SYNONYM METRIC_EXT_ARR FOR PLTSDB.METRIC_EXT_ARR;
+CREATE PUBLIC SYNONYM TSDB_TRACER FOR PLTSDB.TSDB_TRACER;

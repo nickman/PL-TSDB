@@ -312,8 +312,13 @@ create or replace PACKAGE TSDB_UTIL AS
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
+<<<<<<< HEAD
   FUNCTION CLEAN(str IN VARCHAR2, repl IN CHAR DEFAULT '.') RETURN VARCHAR2;
   
+=======
+  FUNCTION CLEAN(str IN VARCHAR2, repl IN CHAR DEFAULT '.') RETURN VARCHAR2 ;
+    
+>>>>>>> c2c8203fa02493a1148168ad4ad737c1eaa344f3
   --===================================================================================================================
   --  Cleans the passed string to remove whitespace, lowercase and illegal punctuation
   --===================================================================================================================
