@@ -48,6 +48,12 @@ create or replace PACKAGE TSDB_TRACER authid definer AS
   /** The DBMS_APPLICATION_INFO.ACTION Metric Tag Key */
   DAI_ACTION_TAG_KEY CONSTANT VARCHAR2(6) := 'action';
 
+  --==================================================================================
+  -- Tag and metric formating token constants
+  --==================================================================================
+  /** The replacement token for the name of the value column */
+  METRIC_TOKEN_VAL_COLUMN CONSTANT VARCHAR2(6) := '#VCOL#';
+
   TYPE METRIC_REC IS RECORD (
     METRIC_ID NUMBER,
     XROWID VARCHAR2(18),
@@ -827,15 +833,6 @@ create or replace PACKAGE BODY TSDB_TRACER AS
   END APPINFOTAGS;
   
   
-  
---  /** The DBMS_APPLICATION_INFO.CLIENT_INFO Metric Tag Key */
---  DAI_CLIENT_TAG_KEY CONSTANT VARCHAR2(5) := 'cinfo';
---  /** The DBMS_APPLICATION_INFO.MODULE Metric Tag Key */
---  DAI_MODULE_TAG_KEY CONSTANT VARCHAR2(6) := 'module';
---  /** The DBMS_APPLICATION_INFO.ACTION Metric Tag Key */
---  DAI_ACTION_TAG_KEY CONSTANT VARCHAR2(6) := 'action';
-  
-  
   -- Posts the passed content to the configured HTTP endpoint
   PROCEDURE POST(content IN CLOB) IS
     req   UTL_HTTP.REQ;
@@ -999,7 +996,28 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     );
   END IS_NUM_OR_DATE;
   
-  
+  -- Extracts the timestamp from the current row in ms.
+  FUNCTION GET_ROW_TS(cursorNum IN OUT NOCOPY NUMBER, tsType IN PLS_INTEGER, colcnt IN NUMBER) RETURN NUMBER IS
+    tsTimestamp TIMESTAMP;
+    tsTimestampWTimeZone TIMESTAMP WITH TIME ZONE;
+    tsDate DATE;
+    tsNumber NUMBER;
+  BEGIN
+      IF(tsType=DBMS_TYPES.TYPECODE_TIMESTAMP) THEN
+        DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestamp);
+        RETURN TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestamp);
+      ELSEIF(tsType=DBMS_TYPES.TYPECODE_DATE) THEN       
+        DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsDate);
+        RETURN TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, TSDB_UTIL.DATETOTIMESTAMP(tsDate));
+      ELSEIF(tsType=DBMS_TYPES.TYPECODE_NUMBER) THEN       
+        DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsNumber);
+        RETURN tsNumber;
+      ELSE
+        DBMS_SQL.COLUMN_VALUE(cursorNum, colcnt, tsTimestampWTimeZone);
+        RETURN TSDB_UTIL.ELAPSEDMS(TSDB_UTIL.EPOCH, tsTimestampWTimeZone);
+      END IF;
+  END GET_ROW_TS;
+
   
   --====================================================================================================
   -- Converts the results from the passed opened and parsed cursor number to an array of metrics.
@@ -1008,6 +1026,14 @@ create or replace PACKAGE BODY TSDB_TRACER AS
   -- SPEC:  [TIMESTAMP # OR DATE OR TIMESTAMP],METRIC_NAME_FORMAT, [TAGKEY1FMT, TAGVALUE1FMT,TAGKEY1nFMT,TAGVALUEnFMT], VALUE1, [...VALUEn]
   --====================================================================================================
   FUNCTION CURSORINTTOMETRICS(cursorNum IN OUT NOCOPY NUMBER) RETURN METRIC_ARR IS
+    --
+    -- Move to package
+    --
+    --TYPE TAGMAP IS TABLE OF VARCHAR2(360) INDEX BY VARCHAR2(360);
+    --
+
+    --tags TAGMAP := TAGMAP();
+    tags TAGPAIR_ARR := TAGPAIR_ARR();
     cntr PLS_INTEGER := 0;
     rows_processed INTEGER;    
     desctab  DBMS_SQL.DESC_TAB3;
@@ -1017,11 +1043,15 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     tsType PLS_INTEGER := NULL;
     tsTypeName VARCHAR2(200);
     tId PLS_INTEGER := 3;
+    vId PLS_INTEGER := 1;
+    mId PLS_INTEGER := 1;
     tagCount PLS_INTEGER;
     met METRIC := NULL;
     metrics METRIC_ARR := METRIC_ARR();
+
     metName VARCHAR2(100);
     metValue NUMBER;
+    metValueColName VARCHAR2(100);
     tagK VARCHAR2(100);
     tagV VARCHAR2(100);
     rowsFetched PLS_INTEGER := 0;    
@@ -1031,6 +1061,12 @@ create or replace PACKAGE BODY TSDB_TRACER AS
     tsNumber NUMBER;
     typeCodes INT_ARR;
     metricNameFormat VARCHAR2(360);
+    valuesIndex PLS_INTEGER := -1;
+    tagsIndex PLS_INTEGER := -1;
+    columnNames VARCHAR2_ARR := VARCHAR2_ARR();
+    valueColumnNames VARCHAR2_ARR := VARCHAR2_ARR();
+    tsType PLS_INTEGER := -1;    
+    valuesCount PLS_INTEGER := 0;
     
   BEGIN
     DBMS_SQL.DESCRIBE_COLUMNS3(cursorNum, colcnt, desctab);    
@@ -1039,65 +1075,66 @@ create or replace PACKAGE BODY TSDB_TRACER AS
       RETURN metrics;
     END IF;
     typeCodes.extend(colcnt);
+    columnNames.extend(colcnt);
     FOR i IN 1..colcnt LOOP
       typeCodes(i) := desctab(i).col_type;
+      columnNames(i) := desctab(i).col_name;
     END LOOP;
-    -- Find the index of the first +1 col that is a number (the index of the first value)
+    
     
     -- Determine if the first column is NOT a String, meaning a timestamp is provided
-    IF(IS_CHAR_TYPE(typeCodes(1))) THEN
-      hasTs := FALSE;
-    ELSE
+    IF(IS_CHAR_TYPE(typeCodes(1))=FALSE) THEN
+      -- If hasTs is true, then column(1) coltype must be a timestamp/date/number (i.e. a datatype from which a timestamp can be derived)
+      IF(IS_NUM_OR_DATE(typeCodes(1)) = FALSE) THEN
+        RAISE invalid_metrics_cursor;
+      END IF;
       hasTs := TRUE;
+      tsType := typeCodes(1);
+      tagsIndex := 3;
+      IF(tsType=DBMS_TYPES.TYPECODE_TIMESTAMP) THEN
+        DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, tsTimestamp);
+      ELSEIF(tsType=DBMS_TYPES.TYPECODE_DATE) THEN       
+        DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, tsDate);
+      ELSEIF(tsType=DBMS_TYPES.TYPECODE_NUMBER) THEN       
+        DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, tsNumber);
+      ELSE
+        DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, tsTimestampWTimeZone);
+      END IF;
+      DBMS_SQL.DEFINE_COLUMN(cursorNum, 2, metricNameFormat, 100);      
+    ELSE
+      hasTs := FALSE;
+      tagsIndex := 2;
+      DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, metricNameFormat, 100);
     END IF;
-    
-    
-    
-    hasTs := IS_CHAR_TYPE(typeCodes(1)) != TRUE;
-    -- If hasTs is true, then column(1) coltype must be a timestamp/date/number (i.e. a datatype from which a timestamp can be derived)
-    IF(IS_NUM_OR_DATE(typeCodes(1)) = FALSE) THEN
+
+    -- Find the index of the first +1 col that is a number (the index of the first value)
+    FOR i IN 2..typeCodes.COUNT LOOP
+      IF(typeCodes(i)=DBMS_TYPES.TYPECODE_NUMBER) THEN
+        valuesIndex := i;
+        EXIT;
+      END IF;      
+    END LOOP;
+    -- If values index was not found, invalid cursor
+    IF(valuesIndex=-1) THEN
       RAISE invalid_metrics_cursor;
     END IF;
-    --  find the first index of the <values> in the query
-    FOR i IN 1..typeCodes.COUNT LOOP
-      NULL;
-      
-    END LOOP;
-    
-    
-    
-    
---    
---    
---      tagCount := (colcnt - 3) / 2;
---    ELSE
---      tagCount := (colcnt - 2) / 2;
---    END IF;
-    DBMS_SQL.DEFINE_COLUMN(cursorNum, 1, metValue); 
-    DBMS_SQL.DEFINE_COLUMN(cursorNum, 2, metName, 100); 
-    IF(hasTs) THEN
-      tsType := desctab(colcnt).col_type;
-      tsTypeName := desctab(colcnt).col_type_name;
-      LOGGING.debug('TSTYPE: [' || tsType || '], TS NAME: [' || tsTypeName || '], COLCNT: [' || colcnt || ']');
-      CASE tsType
-        WHEN DBMS_TYPES.TYPECODE_TIMESTAMP THEN
-          LOGGING.debug('DEFINE TIMESTAMP');
-          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt,  tsTimestamp);
-        WHEN 181 THEN
-          LOGGING.debug('DEFINE TIMESTAMP WITH TZ');
-          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsTimestampWTimeZone);          
-        WHEN DBMS_TYPES.TYPECODE_DATE THEN
-          LOGGING.debug('DEFINE DATE');
-          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsDate);
-        WHEN DBMS_TYPES.TYPECODE_NUMBER THEN
-          LOGGING.debug('DEFINE NUMBER');
-          DBMS_SQL.DEFINE_COLUMN(cursorNum, colcnt, tsNumber);
-        ELSE
-          RAISE unsupported_timestamp_type;
-      END CASE;
+    -- Value count is columnCount minus valuesIndex
+    valuesCount := colcnt - valuesIndex;
+    valueColumnNames.extend(valuesCount);
+    -- Get tag count. If tag count is not zero or even, invalid cursor
+    IF(valuesIndex = tagsIndex) THEN
+      tagCount := 0;
+    ELSE
+      tagCount := valuesIndex - tagsIndex;
+      IF(tagCount < 0 OR MOD(tagCount,2)!=0) THEN
+        RAISE invalid_metrics_cursor;
+      END IF;
     END IF;
+
+--  /** The replacement token for the name of the value column */
+--  METRIC_TOKEN_VAL_COLUMN CONSTANT VARCHAR2(6) := '#VCOL#';
     LOGGING.debug('CURSORINTTOMETRICS: Tag Pairs: ' || tagCount || ', TS: ' || BOOL_TO_CHAR(hasTs));
-    
+    tId := tagsIndex;    
     FOR i IN 1..tagCount LOOP
       DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, DBMS_TYPES.TYPECODE_VARCHAR2, 100);
       LOGGING.debug('Bound Tag Key [' || i || '] at position [' || tId || ']');
@@ -1107,7 +1144,59 @@ create or replace PACKAGE BODY TSDB_TRACER AS
       LOGGING.debug('Bound Tag Value [' || i || '] at position [' || tId || ']');
       tId := tId + 1;
     END LOOP;
+
+    -- Index and define metric value columns
     LOGGING.debug('CURSORINTTOMETRICS: Tags Bound');
+    FOR i IN valuesIndex..colcnt LOOP
+      DBMS_SQL.DEFINE_COLUMN(cursorNum, tId, metValue);
+      valueColumnNames(i-valuesCount+1) := columnNames(tId);
+      tId := tId + 1;
+    END LOOP;
+
+    -- All columns now defined.
+    LOGGING.debug('CURSORINTTOMETRICS: Executing...');
+    
+    LOOP      
+      tId := 1;
+      vId := 1;
+      rowsFetched := DBMS_SQL.FETCH_ROWS(cursorNum);
+      EXIT WHEN rowsFetched = 0;
+      cntr := cntr + 1;        
+      LOGGING.debug('Processing Row#' || cntr);
+      IF(hasTs) THEN
+        tsNumber := GET_ROW_TS(cursorNum, tsType, tId);
+        tId := tId + 1;        
+      END IF;
+      DBMS_SQL.COLUMN_VALUE(cursorNum, tId, metricNameFormat);
+      tId := tId + 1;
+      -- Load Tags
+      FOR i IN 1..tagCount LOOP
+        DBMS_SQL.COLUMN_VALUE(cursorNum, tId, tagK);
+        tId := tId + 1;
+        DBMS_SQL.COLUMN_VALUE(cursorNum, tId, tagV);
+        tId := tId + 1;
+        tags(i) := TAGPAIR(TSDB_UTIL.CLEAN(tagK), TSDB_UTIL.CLEAN(tagV));
+      END LOOP;
+      -- Load Values
+      FOR i IN 1..valuesCount LOOP
+        -- columnNames(tId)
+        DBMS_SQL.COLUMN_VALUE(cursorNum, tId, metValue);
+        metName := TSDB_UTIL.CLEAN(REPLACE(metricNameFormat, METRIC_TOKEN_VAL_COLUMN, columnNames(tId)));
+        met := METRIC(metName, tags).VAL(metValue);
+        IF(hasTs) THEN
+          met := met.TS(tsNumber);
+        END IF;
+        metrics.extend();
+        metrics(mId) := met; 
+        vId := vId + 1;
+        mId := mId + 1;
+      END LOOP;
+
+
+      tags.DELETE();
+    END LOOP;
+
+
     tId := 3;
     colnum := desctab.first;
     LOGGING.debug('CURSORINTTOMETRICS: Executing...');
